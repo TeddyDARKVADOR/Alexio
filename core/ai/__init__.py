@@ -55,7 +55,7 @@ from pathlib import Path
 
 from core import telemetry
 
-from . import gemini, local
+from . import anthropic, gemini, local, openai, registry, router
 from .errors import (
     AIError,
     CapabilityUnavailable,
@@ -63,18 +63,25 @@ from .errors import (
     ProviderUnavailable,
     QuotaExceeded,
 )
+from .router import Budget, NoModelFits, Privacy
+from .tools import ToolSpec, adopt_gemini_declarations, render_all
 from .types import Completion, Image, Media, Tier, Usage
 
 __all__ = [
-    "generate", "available_providers", "active_provider",
+    "generate", "generate_text", "available_providers", "active_provider",
+    "reachable_providers", "explain_routing",
     "Completion", "Image", "Media", "Tier", "Usage",
+    "Budget", "Privacy", "NoModelFits",
+    "ToolSpec", "adopt_gemini_declarations", "render_all",
     "AIError", "CapabilityUnavailable", "EmptyResponse",
     "ProviderUnavailable", "QuotaExceeded",
 ]
 
 _PROVIDERS = {
-    gemini.NAME: gemini,
-    local.NAME:  local,
+    gemini.NAME:    gemini,
+    anthropic.NAME: anthropic,
+    openai.NAME:    openai,
+    local.NAME:     local,
 }
 
 _DEFAULT_PROVIDER = gemini.NAME
@@ -124,17 +131,75 @@ def available_providers() -> dict[str, set[str]]:
     return {name: set(mod.CAPABILITIES) for name, mod in _PROVIDERS.items()}
 
 
-def _resolve(needs: set[str]) -> list:
-    """Providers that can serve `needs`, preferred first.
+def reachable_providers() -> set[str]:
+    """Providers with an adapter AND credentials on this machine.
 
-    Deliberately dumb: the configured provider, then anything else that has the
-    capability. Phase 03 replaces this with the registry lookup and a Budget —
-    filter by capability, order by measured p95 latency, take the first that
-    fits. The signature is what matters; the body is a placeholder.
+    The catalogue in registry.py describes what exists in the world; this says
+    what this install can actually call. Without the distinction the router
+    happily picks Claude on a box that has no Anthropic key.
     """
+    out = set()
+    for name, mod in _PROVIDERS.items():
+        check = getattr(mod, "has_credentials", None)
+        if check is None or check():
+            out.add(name)
+    return out
+
+
+def _resolve(needs: set[str], tier: str, budget: Budget | None = None) -> list:
+    """Providers that can serve this request, best first.
+
+    This is the seam phase 03 filled in. It used to be "the configured provider,
+    then anyone else"; it now asks the router, which filters the catalogue by
+    capability, privacy, latency and cost and orders what is left by *measured*
+    p95 latency where there is enough evidence to mean anything.
+
+    The configured provider still leads when it survives the filter — an
+    explicit choice in config should not be quietly overruled by a router that
+    thinks it knows better — but it no longer wins by default.
+    """
+    reachable = reachable_providers()
+    budget = budget or Budget(tier=tier, needs=frozenset(needs))
+    budget = Budget(
+        tier=tier,
+        needs=frozenset(needs),
+        max_latency_ms=budget.max_latency_ms,
+        max_cost_usd=budget.max_cost_usd,
+        privacy=budget.privacy,
+    )
+
+    try:
+        ranked = router.candidates(budget, available=reachable)
+    except NoModelFits:
+        # No catalogue entry fits. Fall back to raw capability matching so a
+        # provider the catalogue has not caught up with can still answer.
+        ranked = []
+
+    order: list[str] = []
+    for spec in ranked:
+        if spec.provider not in order:
+            order.append(spec.provider)
+
     preferred = active_provider()
-    order     = [preferred] + [n for n in _PROVIDERS if n != preferred]
+    if preferred in order:
+        order.remove(preferred)
+        order.insert(0, preferred)
+
+    for name in _PROVIDERS:
+        if name not in order and name in reachable and needs <= _PROVIDERS[name].CAPABILITIES:
+            order.append(name)
+
     return [_PROVIDERS[n] for n in order if needs <= _PROVIDERS[n].CAPABILITIES]
+
+
+def explain_routing(tier: str = Tier.STANDARD, needs: set[str] | None = None) -> str:
+    """Why the router would pick what it picks — for the log, and for the day a
+    choice looks wrong. A router nobody can interrogate is a router nobody
+    trusts."""
+    return router.explain(
+        Budget(tier=tier, needs=frozenset(needs or {"text"})),
+        available=reachable_providers(),
+    )
 
 
 def generate(
@@ -145,6 +210,7 @@ def generate(
     tier:      str                = Tier.STANDARD,
     grounding: bool               = False,
     task:      str                = "generic",
+    budget:    Budget | None      = None,
     timeout:   int                = 60,
 ) -> Completion:
     """Ask for one answer.
@@ -157,6 +223,9 @@ def generate(
     grounding — answer must be backed by a live web search.
     task      — a short label for the telemetry log ("summarize", "plan", …).
                 It is what makes the log readable months later, so name it.
+    budget    — optional latency / cost / privacy ceiling. Budget.conversation()
+                when the user is listening, Budget.private() when nothing may
+                leave the machine. Omitted, only the tier constrains the choice.
 
     Raises an AIError subclass when no provider can serve the request, or when
     the one that could, failed. Never returns an empty Completion: a model that
@@ -172,7 +241,7 @@ def generate(
     if grounding:
         needs.add("grounding")
 
-    candidates = _resolve(needs)
+    candidates = _resolve(needs, tier, budget)
     if not candidates:
         raise CapabilityUnavailable(
             f"No configured provider can handle {sorted(needs)}. "

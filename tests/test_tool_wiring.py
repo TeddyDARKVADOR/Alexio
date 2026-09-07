@@ -94,17 +94,15 @@ def test_tool_names_are_unique():
     assert not dupes, f"duplicate tool names shadow each other: {sorted(dupes)}"
 
 
-# Rule R-01: only core/ai/ imports a provider SDK.
+# Rule R-01: only core/ai/ and core/voice/ import a provider SDK.
 #
-# Two files are still exempt, and both hold the *conversational* session — the
-# realtime plane, which the gateway deliberately does not cover. Phase 02
-# extracts a VoiceSession protocol for them and this list goes to zero. It is
-# written out here rather than left implicit so that shrinking it is a visible
-# act, and so nothing new can quietly join it.
-_PLANE_A_EXEMPT = {
-    "main.py",
-    "actions/screen_processor.py",
-}
+# core/ai   is plane B — one-shot requests.
+# core/voice is plane A — the conversational session.
+#
+# This set was {main.py, actions/screen_processor.py} until phase 02. It is now
+# empty, and the second test below keeps it that way: it fails if a name is left
+# here that no longer needs it, so the list can never quietly become history.
+_PLANE_A_EXEMPT: set[str] = set()
 
 _PROVIDER_SDKS = {"anthropic", "openai", "google", "google_genai", "litellm", "cohere", "mistralai"}
 
@@ -138,7 +136,7 @@ def test_no_provider_sdk_imported_outside_the_ai_layer():
     offenders: list[str] = []
     for path in _project_files():
         rel = path.relative_to(ROOT).as_posix()
-        if rel.startswith("core/ai/") or rel in _PLANE_A_EXEMPT:
+        if rel.startswith(("core/ai/", "core/voice/")) or rel in _PLANE_A_EXEMPT:
             continue
         offenders += [f"{rel}:{n}" for n in _sdk_imports(path)]
 
