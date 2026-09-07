@@ -749,6 +749,16 @@ class JarvisLive:
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
 
+        # Short reversible commands answered without a model. Never fatal: a
+        # broken reflex layer must degrade into the ordinary path, not into a
+        # dead assistant.
+        try:
+            from core import local
+            self._reflex = local.build_router()
+        except Exception as e:
+            print(f"[Reflex] disabled: {e}")
+            self._reflex = None
+
         # ── Session resumption ─────────────────────────────────────────
         # The server issues a resumption handle every few seconds and reissues
         # it as the conversation moves on. Before this, session_resumption was
@@ -867,6 +877,25 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
+        """Typed input. Short commands are answered here; everything else goes
+        to the model.
+
+        The reflex path only helps where Alexio already holds the text. On the
+        voice path it cannot: audio goes straight to the Live socket and the
+        transcript comes *back* from the server, by which point the model is
+        already generating — there is nothing left to save. Typed input, the
+        remote dashboard and a future local STT pipeline are where this pays,
+        and it pays about three orders of magnitude (0.16 ms against a round
+        trip). See core/local/reflex.py.
+        """
+        handled = self._reflex.dispatch(text) if self._reflex else None
+        if handled is not None:
+            match, spoken = handled
+            self.ui.write_log(f"You: {text}")
+            self.ui.write_log(f"{self._asst_name}: {spoken}")
+            print(f"[Reflex] {match.intent} ({match.score:.2f}) — model not consulted")
+            return
+
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(self.session.send_text(text), self._loop)

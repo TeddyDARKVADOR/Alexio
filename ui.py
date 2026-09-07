@@ -2601,7 +2601,7 @@ class MainWindow(QMainWindow):
             cam_idx = 0
             try:
                 import json as _j
-                cfg = _j.loads((CONFIG_DIR / "api_keys.json").read_text())
+                cfg = _j.loads((CONFIG_DIR / "api_keys.json").read_text(encoding="utf-8"))
                 cam_idx = int(cfg.get("camera_index", 0))
             except Exception:
                 pass
@@ -2907,7 +2907,8 @@ class MainWindow(QMainWindow):
                 launcher.write_text(
                     "#!/usr/bin/env bash\n"
                     f'cd "{script.parent}"\n'
-                    f'exec "{python}" "{script}"\n'
+                    f'exec "{python}" "{script}"\n',
+                    encoding="utf-8",
                 )
                 launcher.chmod(launcher.stat().st_mode
                                | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH)
@@ -2924,7 +2925,8 @@ class MainWindow(QMainWindow):
                     '  <key>CFBundleName</key><string>J.A.R.V.I.S</string>\n'
                     '  <key>CFBundlePackageType</key><string>APPL</string>\n'
                     '  <key>CFBundleVersion</key><string>1.0</string>\n'
-                    '</dict></plist>\n'
+                    '</dict></plist>\n',
+                    encoding="utf-8",
                 )
 
                 # Optional: copy icon as .icns (skip silently if Pillow is missing)
@@ -2934,13 +2936,14 @@ class MainWindow(QMainWindow):
                     PIL.Image.open(ico_path).save(icns, format="ICNS")
                     # Inject icon reference into plist
                     plist = app / "Contents" / "Info.plist"
-                    txt = plist.read_text()
+                    txt = plist.read_text(encoding="utf-8")
                     plist.write_text(
                         txt.replace(
                             '</dict></plist>',
                             '  <key>CFBundleIconFile</key>'
                             '<string>AppIcon</string>\n</dict></plist>\n',
-                        )
+                        ),
+                        encoding="utf-8",
                     )
                 except Exception:
                     pass  # icon is optional
@@ -2968,7 +2971,8 @@ class MainWindow(QMainWindow):
                     "Type=Application\n"
                     "Terminal=false\n"
                     "Categories=Utility;\n"
-                    + icon_line
+                    + icon_line,
+                    encoding="utf-8",
                 )
                 desk.chmod(desk.stat().st_mode | 0o755)
 
@@ -3671,7 +3675,8 @@ class MainWindow(QMainWindow):
                         f'    <string>{script}</string>\n'
                         '  </array>\n'
                         '  <key>RunAtLoad</key><true/>\n'
-                        '</dict></plist>\n'
+                        '</dict></plist>\n',
+                        encoding="utf-8",
                     )
             else:
                 desk_dir = Path.home() / ".config" / "autostart"
@@ -3685,7 +3690,8 @@ class MainWindow(QMainWindow):
                         f"Name={self._assistant_name}\n"
                         f"Exec={sys.executable} {script}\n"
                         "Type=Application\nTerminal=false\n"
-                        "X-GNOME-Autostart-enabled=true\n"
+                        "X-GNOME-Autostart-enabled=true\n",
+                        encoding="utf-8",
                     )
             enabled = not currently_on
             self._update_autostart_btn(enabled)

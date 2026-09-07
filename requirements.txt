@@ -33,6 +33,11 @@ beautifulsoup4
 ddgs>=9.0.0
 playwright
 
+# ── Bureau : portails, D-Bus ─────────────────────────────────────────────────
+# D-Bus en Python pur, pour xdg-desktop-portal (capture d'écran, corbeille,
+# fond d'écran) sous Wayland. Pas de compilation, pas de PyGObject — voir R-10.
+jeepney; sys_platform == "linux"
+
 # ── Contrôle du poste ────────────────────────────────────────────────────────
 pyautogui
 pyperclip

@@ -184,15 +184,23 @@ def _format_size(b: int) -> str:
     return f"{b:.1f} TB"
 
 def _safe_trash(target: Path) -> str:
+    """Move to the desktop trash — never unlink.
 
-    if not _SEND2TRASH:
+    The user asked to delete a file, not to make it unrecoverable, and a voice
+    assistant mishears. core/desktop prefers the Trash portal on Linux, which
+    is the mechanism the file manager itself uses, and falls back to send2trash
+    everywhere else. Permanent deletion is deliberately not offered.
+    """
+    from core import desktop
+
+    try:
+        desktop.trash(target)
+        return f"Moved to Trash: {target.name}"
+    except Exception as e:
         return (
-            "send2trash is not installed. "
-            "Run: pip install send2trash — "
+            f"Could not move {target.name} to the trash: {e} "
             "Permanent deletion is disabled for safety."
         )
-    send2trash.send2trash(str(target))
-    return f"Moved to Trash: {target.name}"
 
 
 def list_files(path: str = "desktop", show_hidden: bool = False) -> str:

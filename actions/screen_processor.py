@@ -101,16 +101,16 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         return img_bytes, f"image/{source_format.lower()}"
 
 def _capture_screen() -> tuple[bytes, str]:
+    """Capture the screen, whichever mechanism this desktop actually allows.
 
-    if not _MSS:
-        raise RuntimeError("mss is not installed. Run: pip install mss")
+    This used to call mss directly. Under Wayland mss does not fail — it
+    succeeds and returns a black rectangle, so the assistant would confidently
+    describe an empty screen. core/desktop picks the portal there and mss on
+    X11 and Windows, and says which it used.
+    """
+    from core import desktop
 
-    with mss.mss() as sct:
-        monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
-        target   = monitors[1] if len(monitors) > 1 else monitors[0]
-        shot     = sct.grab(target)
-        png      = mss.tools.to_png(shot.rgb, shot.size)
-
+    png, _mime = desktop.screenshot()
     return _compress(png, "PNG")
 
 

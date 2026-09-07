@@ -1,0 +1,51 @@
+# Alexio — the offline speech pipeline. Opt-in.
+#
+#   .venv/bin/pip install -r requirements-local.txt
+#
+# Nothing here is needed to run Alexio. Installing it lets the assistant hear,
+# speak and wake up without the network, and enables the LOCAL_ONLY privacy
+# route in the model router.
+#
+# Sizes are the honest ones, because on the target machine — i5-8265U, no GPU,
+# ~5 GB of RAM free — they are the deciding factor:
+#
+#   onnxruntime          ~ 15 MB   CPU inference for both Parakeet and the VAD
+#   Parakeet TDT v3      ~600 MB   downloaded on first use, then fully offline
+#   Piper + one voice    ~ 65 MB   the voice is ~63 MB of it
+#   openWakeWord models  ~ 10 MB
+#
+# Check what is active with:
+#   .venv/bin/python -c "from core import local; print(local.report())"
+
+# ── speech to text ───────────────────────────────────────────────────────────
+# Parakeet TDT 0.6B v3: ~30x real time on CPU, 6.34% average WER, 25 European
+# languages including French, with automatic language detection.
+onnx-asr[cpu]>=0.6
+
+# Fallback only. ~3x real time on CPU, which is the difference between
+# transcribing while you speak and transcribing after you stop.
+# faster-whisper>=1.1
+
+# ── text to speech ───────────────────────────────────────────────────────────
+# Piper: ~40 ms to first audio, RTF ~0.03. French voices: siwis, tom, upmc.
+#   python -m piper.download_voices fr_FR-siwis-medium
+piper-tts>=1.6
+
+# Online fallback, no model download, needs the network.
+# edge-tts>=7.0
+
+# NOT kokoro: 3.6 s before the first sample and 2 GB peak memory. It sounds
+# better and this machine cannot hold a conversation with it.
+
+# ── wake word and voice activity ─────────────────────────────────────────────
+# Ends the current behaviour where the microphone is open for the whole session
+# and every sound in the room reaches the network.
+openwakeword>=0.6
+silero-vad>=5.1
+
+# ── optional: embeddings for the reflex router ───────────────────────────────
+# The lexical matcher in core/local/reflex.py needs nothing and handles the
+# closed phrase set. Uncomment to trade ~330 MB for paraphrase tolerance —
+# "j'entends rien" matching "monte le son", which trigrams will never do.
+# Worth it once onnxruntime is installed above anyway.
+# fastembed>=0.8

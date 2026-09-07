@@ -124,7 +124,9 @@ Le critère est la réversibilité, pas la gravité du mot.
 
 **R-08** · Aucune chaîne visible par l'utilisateur codée en dur dans une langue.
 
-**R-09** · Sous Wayland : **portail, jamais X11**. `mss`, `pyautogui`, `pygetwindow` sont morts ici.
+**R-09** · Sous Wayland : **portail, jamais X11**. Passer par `core/desktop`, jamais
+appeler `mss` / `pyautogui` / `pygetwindow` directement depuis une action.
+
 
 **R-10** · Pas de PyGObject dans le venv. D-Bus via `jeepney` / `dbus-fast` (Python pur).
 AT-SPI dans un processus fils lancé avec `/usr/bin/python3`.
@@ -133,6 +135,18 @@ AT-SPI dans un processus fils lancé avec `/usr/bin/python3`.
 tokens_in, tokens_out, latency_ms, cost_est, ok`. Échecs et hits de cache compris.
 
 **R-12** · Un budget impossible lève une erreur ; jamais de dégradation silencieuse.
+**R-13** · **Multi-plateforme par construction.** Aucun module de `core/` n'importe un paquet
+spécifique à un OS au niveau module — toujours dans la fonction qui s'en sert. C'est ce qui
+permet à `desktop.report("Windows")` et aux tests d'inspecter Windows depuis Linux.
+`tests/test_windows_compat.py` l'applique.
+
+**R-14** · **Tout `open()` / `read_text()` / `write_text()` déclare `encoding="utf-8"`.**
+Sur un Windows français le défaut est cp1252 : lire un JSON contenant un accent lève
+`UnicodeDecodeError` là-bas et nulle part ailleurs. Appliqué par un test.
+
+**R-15** · Un réflexe ne fait que du **réversible**. Le matcher a raison la plupart du temps,
+pas toujours ; le prix d'une erreur doit être une contrariété, pas un dossier supprimé.
+
 
 ---
 
@@ -140,8 +154,10 @@ tokens_in, tokens_out, latency_ms, cost_est, ok`. Échecs et hits de cache compr
 
 ```bash
 .venv/bin/python main.py            # lancer
-.venv/bin/python -m pytest          # 104 tests, sans micro/écran/clé API/réseau
+.venv/bin/python -m pytest          # 255 tests, sans micro/écran/clé API/réseau
 .venv/bin/python -m core.telemetry  # ce que les modèles ont réellement coûté
+.venv/bin/python -c "from core import desktop; print(desktop.report())"  # capacités système
+.venv/bin/python -c "from core import local;   print(local.report())"    # pile hors-ligne
 ```
 
 - **Python : `.venv` construit sur pyenv 3.11.4** (`asyncio.TaskGroup` exige ≥ 3.11).
@@ -155,27 +171,45 @@ Sur Linux, `pyautogui` ouvre un display X à l'import et lève `DisplayConnectio
 n'y en a pas (SSH, TTY, unité systemd, CI). Ce n'est pas une `ImportError` : la garde étroite
 laissait l'exception tuer l'import de `main.py` en entier. Cinq modules étaient concernés.
 
-### Surface système Fedora 43 / Wayland
+### `core/desktop` — une façade, trois backends (phase 04)
 
-| Besoin | À utiliser | À ne plus utiliser |
-|---|---|---|
-| Capture écran | `org.freedesktop.portal.Screenshot` v2 (`interactive: false`) | `mss` — image noire |
-| Clavier/souris | `org.freedesktop.portal.RemoteDesktop` v2 + libei 1.5.0 (`restore_token`) | `pyautogui` — XWayland seulement |
-| Luminosité | `org.freedesktop.login1.Session.SetBrightness(ssu)` | `brightnessctl` — absent ; `gsd.Power.Screen` n'existe plus sur GNOME 49 |
-| Volume | `wpctl` / `pactl` (PipeWire) | — |
-| Corbeille | `org.freedesktop.portal.Trash` | `send2trash` |
-| Fenêtres | AT-SPI (`at-spi2-core` 2.58.7) | `pygetwindow` — sans objet sous Wayland |
-| Rappels | `systemd-run --user` (présent), `at` en secours | — |
+Aucun module d'action ne refait `if _OS == "Windows": … elif "Darwin": …`.
 
-Fonctionnent déjà : `gsettings` (mode sombre), `notify-send`, `ffmpeg`, `xdg-open`.
+```python
+from core import desktop
+data, mime = desktop.screenshot()
+desktop.brightness_set(60); desktop.trash(p); desktop.notify("Titre", "Corps")
+print(desktop.report())        # la matrice de capacités de cette machine
+```
 
-### Pile locale viable sur ce matériel
+Une capacité n'est pas un booléen : `Capability(nom, disponible, backend, détail)`.
+Un « non » **doit** dire ce qui le corrigerait.
 
-- **STT** : Parakeet TDT 0.6B v3 (ONNX int8, ~30× temps réel, français). *Pas* faster-whisper.
-- **TTS** : Piper (OHF-Voice v1.6.0, ~40 ms au premier son, voix `siwis`/`tom`/`upmc`).
-  *Pas* Kokoro : 3,6 s et 2 Go de pic.
-- **VAD / réveil** : Silero VAD + openWakeWord.
-- **LLM local** : Qwen3 1.7B Q4 maximum, réservé à la classification d'intention.
+| Surface | Linux/Wayland | Windows | macOS |
+|---|---|---|---|
+| Capture | portail Screenshot v2 | mss | screencapture |
+| Luminosité | logind `SetBrightness` | WMI/PowerShell | ✗ (aucune API scriptable) |
+| Volume | wpctl/pactl | pycaw | osascript |
+| Corbeille | portail Trash | send2trash | send2trash |
+| Presse-papiers | pyperclip / wl-clipboard | pyperclip | pyperclip / pbcopy |
+| Notification | notify-send | win10toast | osascript |
+| Fond d'écran | portail Wallpaper | SystemParametersInfoW | osascript |
+| Entrées | ✗ ydotool/wtype absents | SendInput | Quartz (permission) |
+
+`mss` sous Wayland **ne plante pas** : il renvoie un rectangle noir. C'est pour ça que la
+détection de session passe avant le choix du mécanisme.
+
+### `core/local` — hors-ligne (phase 05)
+
+- **`reflex`** — commandes courtes traitées **sans modèle**. Zéro dépendance, **0,27 ms**
+  par décision, 8 intentions / 78 phrases FR+EN. Seules des actions **réversibles** ont le
+  droit d'y figurer : `ReflexRouter.register()` refuse une intention `reversible=False`.
+  Branché sur la saisie texte de `main.py`. **Pas** sur la voix : avec Gemini Live le
+  transcript revient *du serveur*, le modèle génère déjà — il n'y a plus rien à gagner.
+  Il faudra le STT local pour ça.
+- **`speech`** — Parakeet TDT v3 (STT) et Piper (TTS), chargés paresseusement.
+  Rien n'est installé par défaut : `pip install -r requirements-local.txt`.
+  *Pas* faster-whisper (~3× temps réel contre ~30×), *pas* Kokoro (3,6 s et 2 Go de pic).
 
 ---
 
@@ -204,7 +238,12 @@ Reste :
 - Dashboard : clé 6 caractères en SHA-256 + sel fixe, jetons d'appareil sans expiration,
   page `/` authentifiée côté client seulement, ouverture automatique du pare-feu avec élévation.
 - `config/certs/jarvis.key` est dans l'historique Git malgré le `.gitignore`.
-- 104 tests, mais aucune CI ne les lance encore.
+- 255 tests, mais aucune CI ne les lance encore.
+- **Injection clavier/souris indisponible sous Wayland** : ni `ydotool` ni `wtype` installés,
+  et `pyautogui` ne touche que les fenêtres XWayland. `libei` 1.5.0 et le portail
+  RemoteDesktop v2 sont présents — le câblage reste à faire.
+- Alexio n'a **jamais été exécuté sous Windows** depuis la refonte. La phase 07 vérifie que
+  rien ne l'en empêche ; ce n'est pas la même chose que de l'avoir vu tourner.
 
 ---
 

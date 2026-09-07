@@ -126,41 +126,28 @@ def volume_get() -> int | None:
 
 
 def brightness_get() -> int | None:
-    """Current brightness 0-100, or None where it cannot be read."""
+    """Current brightness 0-100, or None where the platform will not say.
+
+    Delegated to core/desktop, which knows that GNOME 49 removed
+    org.gnome.SettingsDaemon.Power.Screen and that logind's SetBrightness
+    replaced it — and that macOS exposes no readable absolute value at all,
+    which is why undo correctly declines to register brightness changes there.
+    """
     try:
-        if _OS == "Windows":
-            r = subprocess.run(
-                ["powershell", "-Command",
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness)"
-                 ".CurrentBrightness"],
-                capture_output=True, text=True, timeout=5, **_WIN_HIDE
-            )
-            return max(0, min(100, int(r.stdout.strip())))
-        if _OS == "Linux" and subprocess.run(
-                ["which", "brightnessctl"], capture_output=True).returncode == 0:
-            cur = int(subprocess.run(["brightnessctl", "get"],
-                                     capture_output=True, text=True, timeout=5).stdout.strip())
-            mx  = int(subprocess.run(["brightnessctl", "max"],
-                                     capture_output=True, text=True, timeout=5).stdout.strip())
-            return max(0, min(100, round(cur * 100 / mx))) if mx else None
+        from core import desktop
+        return desktop.brightness_get()
     except Exception:
-        pass
-    return None
+        return None
 
 
 def brightness_set(value: int) -> None:
     """Set brightness to an absolute percentage. Only used to restore a value
     captured before a change, so it is undo's counterpart to the up/down pair."""
-    value = max(0, min(100, int(value)))
-    if _OS == "Windows":
-        subprocess.run(
-            ["powershell", "-Command",
-             "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
-             f".WmiSetBrightness(1, {value})"],
-            capture_output=True, timeout=5, **_WIN_HIDE
-        )
-    elif _OS == "Linux":
-        subprocess.run(["brightnessctl", "set", f"{value}%"], capture_output=True)
+    from core import desktop
+    try:
+        desktop.brightness_set(value)
+    except Exception as e:
+        print(f"[Settings] Brightness set failed: {e}")
 
 
 def volume_set(value: int):
@@ -190,63 +177,45 @@ def volume_set(value: int):
             capture_output=True)
         return
 
-def brightness_up():
+def _brightness_step(delta: int) -> None:
+    """Nudge brightness by `delta` percent, on any platform.
+
+    Was three branches: a `which brightnessctl` probe with an xrandr fallback
+    built by string interpolation into `shell=True`, and a PowerShell one-liner.
+    The Linux fallback only dimmed the framebuffer in software, did nothing at
+    all under Wayland, and spawned a nested python3 to parse `xrandr --verbose`.
+
+    core/desktop reads the real value and writes it back — logind on Linux, WMI
+    on Windows — so this is now read, add, write, and the platform knowledge
+    lives in one place.
+    """
     if _OS == "Darwin":
-        subprocess.run(["osascript", "-e",
-            'tell application "System Events" to key code 144'],
-            capture_output=True)
-    elif _OS == "Linux":
-        if subprocess.run(["which", "brightnessctl"],
-                capture_output=True).returncode == 0:
-            subprocess.run(["brightnessctl", "set", "+10%"], capture_output=True)
-        else:
-            subprocess.run(
-                'xrandr --output $(xrandr | grep " connected" | head -1 | cut -d " " -f1)'
-                ' --brightness $(python3 -c "import subprocess; '
-                'b=float(subprocess.check_output([\"xrandr\",\"--verbose\"]).decode()'
-                '.split(\"Brightness:\")[1].split()[0]); print(min(1.0,b+0.1))")',
-                shell=True, capture_output=True
-            )
-    else:
-        try:
-            subprocess.run(
-                ["powershell", "-Command",
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
-                 ".WmiSetBrightness(1, [math]::Min(100, "
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness).CurrentBrightness + 10))"],
-                capture_output=True, timeout=5, **_WIN_HIDE
-            )
-        except Exception as e:
-            print(f"[Settings] Brightness up failed on Windows: {e}")
+        # macOS exposes no scriptable absolute brightness; the media key is the
+        # honest ceiling. brightness_get() returns None there, so undo correctly
+        # declines to register the change rather than restoring a guess.
+        from core.desktop import macos
+        macos.brightness_step(up=delta > 0)
+        return
+
+    from core import desktop
+
+    current = desktop.brightness_get()
+    if current is None:
+        print("[Settings] Brightness is not readable on this machine.")
+        return
+    try:
+        desktop.brightness_set(max(1, min(100, current + delta)))
+    except Exception as e:
+        print(f"[Settings] Brightness step failed: {e}")
+
+
+def brightness_up():
+    _brightness_step(+10)
+
 
 def brightness_down():
-    if _OS == "Darwin":
-        subprocess.run(["osascript", "-e",
-            'tell application "System Events" to key code 145'],
-            capture_output=True)
-    elif _OS == "Linux":
-        if subprocess.run(["which", "brightnessctl"],
-                capture_output=True).returncode == 0:
-            subprocess.run(["brightnessctl", "set", "10%-"], capture_output=True)
-        else:
-            subprocess.run(
-                'xrandr --output $(xrandr | grep " connected" | head -1 | cut -d " " -f1)'
-                ' --brightness $(python3 -c "import subprocess; '
-                'b=float(subprocess.check_output([\"xrandr\",\"--verbose\"]).decode()'
-                '.split(\"Brightness:\")[1].split()[0]); print(max(0.1,b-0.1))")',
-                shell=True, capture_output=True
-            )
-    else:
-        try:
-            subprocess.run(
-                ["powershell", "-Command",
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods)"
-                 ".WmiSetBrightness(1, [math]::Max(0, "
-                 "(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness).CurrentBrightness - 10))"],
-                capture_output=True, timeout=5, **_WIN_HIDE
-            )
-        except Exception as e:
-            print(f"[Settings] Brightness down failed on Windows: {e}")
+    _brightness_step(-10)
+
 
 def close_app():
     if _OS == "Darwin": pyautogui.hotkey("command", "q")
