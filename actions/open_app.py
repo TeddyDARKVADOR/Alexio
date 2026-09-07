@@ -100,14 +100,17 @@ def _launch_windows(app_name: str) -> bool:
         except Exception:
             pass
 
+    # Last resort: drive the Start menu by hand. Through core/desktop (R-09) —
+    # the mechanism differs by session and this module has no business knowing
+    # which one it got.
     try:
-        import pyautogui
-        pyautogui.PAUSE = 0.1
-        pyautogui.press("win")
+        from core import desktop
+
+        desktop.key("win")
         time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
+        desktop.type_text(app_name, interval=0.05)
         time.sleep(0.9)
-        pyautogui.press("enter")
+        desktop.key("enter")
         time.sleep(2.5)
         return True
     except Exception as e:
@@ -154,12 +157,13 @@ def _launch_macos(app_name: str) -> bool:
             pass
 
     try:
-        import pyautogui
-        pyautogui.hotkey("command", "space")
+        from core import desktop
+
+        desktop.hotkey("command", "space")     # Spotlight
         time.sleep(0.6)
-        pyautogui.write(app_name, interval=0.05)
+        desktop.type_text(app_name, interval=0.05)
         time.sleep(0.8)
-        pyautogui.press("enter")
+        desktop.key("enter")
         time.sleep(1.5)
         return True
     except Exception as e:

@@ -30,10 +30,36 @@ def declared_names() -> set[str]:
 
 @pytest.fixture(scope="module")
 def handled_names() -> set[str]:
-    """Tool names _execute_tool actually dispatches on."""
+    """Tool names the dispatch actually reaches.
+
+    Two places since the confirmation gate went in: most tools are entries in
+    `_sync_handlers`, a table whose values are callables precisely so
+    core/confirm.py can hold one and run it later; the rest are still `name ==`
+    branches because they are async, or touch state on JarvisLive.
+
+    Both are read, and the table is read by *calling* it rather than by parsing
+    it — a dict of lambdas keyed by tool name is exactly the thing a regex over
+    source would get subtly wrong.
+    """
     import main
+
     src = inspect.getsource(main.JarvisLive._execute_tool)
-    return set(re.findall(r'name\s*==\s*"([a-z_]+)"', src))
+    branches = set(re.findall(r'name\s*==\s*"([a-z_]+)"', src))
+
+    table = main.JarvisLive._sync_handlers(_StubLive(), {})
+    return branches | set(table)
+
+
+class _StubLive:
+    """Enough of JarvisLive for `_sync_handlers` to build its closures.
+
+    It never runs them — the point is the set of keys, and building the table
+    must not need a microphone, a Live session or a UI.
+    """
+    ui = None
+
+    def speak(self, *_a, **_kw):    # pragma: no cover - never called
+        raise AssertionError("the handler table must not run anything")
 
 
 def test_every_declared_tool_has_a_handler(declared_names, handled_names):

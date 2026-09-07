@@ -71,8 +71,10 @@ def screenshot() -> tuple[bytes, str]:
     try:
         import mss
         import mss.tools
-    except ImportError as e:
-        raise UnsupportedOnThisPlatform("pip install mss") from e
+    # Pas seulement ImportError : sous X11 sans display, mss lève ScreenShotError
+    # à l'import. Le message doit rester actionnable dans les deux cas.
+    except Exception as e:
+        raise UnsupportedOnThisPlatform(f"pip install mss ({type(e).__name__})") from e
 
     with mss.mss() as sct:
         shot = sct.grab(sct.monitors[0])
@@ -340,27 +342,12 @@ def set_wallpaper(path: str | Path) -> None:
 # says it cannot type.
 
 def input_capability() -> Capability:
-    if not is_wayland():
-        try:
-            import pyautogui  # noqa: F401
-            return Capability("input", True, "pyautogui/XTEST")
-        except Exception:
-            return Capability("input", False, "none", "pip install pyautogui")
+    """Delegated: core/desktop/input.py owns this surface on every platform.
 
-    if has("ydotool"):
-        return Capability("input", True, "ydotool",
-                          "needs the ydotoold daemon running")
-    if has("wtype"):
-        return Capability("input", True, "wtype", "keyboard only, no pointer")
-
-    try:
-        import pyautogui  # noqa: F401
-        return Capability(
-            "input", False, "pyautogui/XTEST",
-            "Wayland: XTEST reaches XWayland windows only, so native GTK/Qt apps "
-            "silently ignore it. Install ydotool, or wire the RemoteDesktop "
-            "portal (libei 1.5.0 and portal v2 are present on this machine)."
-        )
-    except Exception:
-        return Capability("input", False, "none",
-                          "sudo dnf install ydotool && systemctl --user enable --now ydotoold")
+    It used to be answered here, and the answer under Wayland was "no, and here
+    is what would fix it" — install ydotool, or wire the RemoteDesktop portal.
+    The portal is wired now, so the probe and the implementation have to agree,
+    which means exactly one of them can decide.
+    """
+    from . import input as _input
+    return _input.capability_for("linux")

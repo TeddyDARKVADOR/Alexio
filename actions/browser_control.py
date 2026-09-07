@@ -12,13 +12,40 @@ import webbrowser
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import (
-    async_playwright,
-    BrowserContext,
-    Page,
-    Playwright,
-    TimeoutError as PlaywrightTimeout,
-)
+# Playwright pilote le navigateur *contrôlé* (click / type / get_text). Il ne
+# sert à rien pour la navigation simple, qui passe par le navigateur natif de
+# l'utilisateur — donc son absence ne doit coûter que les actions interactives,
+# pas le démarrage d'Alexio. `main.py` importe ce module au niveau module : un
+# import nu ici tuait l'application entière sur une installation neuve.
+# Pas `except ImportError` : playwright peut aussi lever à l'import quand ses
+# navigateurs ne sont pas installés ou que la version du greenlet ne suit pas.
+try:
+    from playwright.async_api import (
+        async_playwright,
+        BrowserContext,
+        Page,
+        Playwright,
+        TimeoutError as PlaywrightTimeout,
+    )
+    _PLAYWRIGHT     = True
+    _PLAYWRIGHT_ERR = ""
+except Exception as _e:
+    _PLAYWRIGHT     = False
+    _PLAYWRIGHT_ERR = f"{type(_e).__name__}: {_e}"
+    print(f"[browser] playwright unavailable ({type(_e).__name__}) — "
+          "interactive browser control disabled, native navigation still works. "
+          "Fix: pip install playwright && playwright install chromium")
+
+    # Les annotations sont différées (`from __future__ import annotations`), donc
+    # `Page` et consorts ne sont jamais évalués. `PlaywrightTimeout` l'est : il
+    # apparaît dans des clauses `except`, où un NameError remplacerait l'erreur
+    # réelle par une erreur d'attribut incompréhensible.
+    class PlaywrightTimeout(Exception):     # type: ignore[no-redef]
+        """Remplaçant inerte — aucune session ne démarre sans playwright."""
+
+    async_playwright = None                 # type: ignore[assignment]
+    BrowserContext = Page = Playwright = None   # type: ignore[assignment,misc]
+
 _OS = platform.system()   # "Windows" | "Darwin" | "Linux"
 
 def _normalize_url(url: str) -> str:
@@ -997,6 +1024,16 @@ def browser_control(
     # Bunlar fiziksel olarak kontrol edilebilir bir tarayıcı gerektirir;
     # yalnızca burada otomasyon penceresi açılır ve açılır açılmaz kullanıcının
     # son gezindiği sayfaya gider — boş sayfada beklemez.
+    #
+    # Tout ce qui suit exige playwright. Un « non » dit ce qui le corrigerait
+    # (R-06 : une capacité se mesure et s'explique, elle ne se devine pas).
+    if not _PLAYWRIGHT:
+        result = (f"Interactive browser control needs playwright, which is not "
+                  f"installed ({_PLAYWRIGHT_ERR}). Navigation still works. "
+                  f"Fix: pip install playwright && playwright install chromium")
+        _log(player, result)
+        return result
+
     try:
         sess = _registry.get(browser)
     except Exception as e:

@@ -1,3 +1,4 @@
+import io
 import os
 import platform
 import re
@@ -193,11 +194,32 @@ def _get_steam_window_rect() -> tuple[int, int, int, int] | None:
     return None
 
 
+def _grab_region(rect: tuple[int, int, int, int]):
+    """A numpy RGB array of one screen rectangle, captured through core/desktop.
+
+    R-09: this file used `pyautogui.screenshot(region=…)`, which under Wayland
+    returns a black rectangle without failing — and a black rectangle passed to
+    a colour-matching heuristic produces a confident wrong click. The facade
+    captures whole screens, so the crop happens here; that is one array slice,
+    against a capture path that is right on every session type.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from core import desktop
+
+    data, _mime = desktop.screenshot()
+    x, y, w, h = rect
+    full = Image.open(io.BytesIO(data)).convert("RGB")
+    return np.array(full.crop((x, y, x + w, y + h)))
+
+
 def _click_first_profile_by_screenshot() -> bool:
 
     try:
-        import pyautogui
         import numpy as np
+
+        from core import desktop
 
         time.sleep(1.5)
         win = _get_steam_window_rect()
@@ -206,8 +228,7 @@ def _click_first_profile_by_screenshot() -> bool:
             return False
 
         wx, wy, ww, wh = win
-        screenshot = pyautogui.screenshot(region=(wx, wy, ww, wh))
-        img        = np.array(screenshot)
+        img        = _grab_region(win)
         h, w       = img.shape[:2]
 
         search_y1, search_y2 = h // 3,  h * 3 // 4
@@ -221,7 +242,7 @@ def _click_first_profile_by_screenshot() -> bool:
 
         if not colorful.any():
             print("[GameUpdater] ⚠️ Avatar rengi bulunamadı — tahminle tıklanıyor")
-            pyautogui.click(wx + ww // 2 - ww // 6, wy + wh // 2)
+            desktop.click(wx + ww // 2 - ww // 6, wy + wh // 2)
             return True
 
         cols = np.where(colorful.any(axis=0))[0]
@@ -236,7 +257,7 @@ def _click_first_profile_by_screenshot() -> bool:
         abs_x = wx + search_x1 + int(block_cols.mean())
         abs_y = wy + search_y1 + int(rows.mean())
         print(f"[GameUpdater] 🎯 Profil avatarı ({abs_x}, {abs_y}) — tıklanıyor")
-        pyautogui.click(abs_x, abs_y)
+        desktop.click(abs_x, abs_y)
         return True
 
     except ImportError as e:
@@ -255,9 +276,9 @@ def _handle_steam_profile_selection() -> bool:
 
     wx, wy, ww, wh = win
     try:
-        import pyautogui, numpy as np
-        screenshot   = pyautogui.screenshot(region=(wx, wy, ww, wh))
-        img          = np.array(screenshot)
+        import numpy as np
+
+        img          = _grab_region(win)
         is_small     = ww < 900 and wh < 700
         top_region   = img[:wh // 3, :, :]
         white_pixels = int(np.sum(
@@ -342,15 +363,18 @@ def _click_button(window, keywords: list[str]) -> bool:
     return False
 
 
-def _handle_install_dialog_pyautogui(game_name: str, best_drive: dict) -> str:
+def _handle_install_dialog_by_coordinates(game_name: str, best_drive: dict) -> str:
+    # pygetwindow only, and only to *find* the dialog — the clicking goes
+    # through core/desktop (R-09). Not ImportError alone: pygetwindow reaches
+    # for a window server at import and raises its own errors when there is none.
     try:
-        import pyautogui
         import pygetwindow as gw
-    except ImportError:
+
+        from core import desktop
+    except Exception:
         return (f"Install dialog opened for '{game_name}'. "
                 f"Please select '{best_drive['letter']}:' and click Install manually.")
 
-    pyautogui.FAILSAFE = False
     drive_label = f"{best_drive['letter']}:"
     install_win = None
 
@@ -375,11 +399,11 @@ def _handle_install_dialog_pyautogui(game_name: str, best_drive: dict) -> str:
 
     wx, wy = install_win.left, install_win.top
     ww, wh = install_win.width, install_win.height
-    pyautogui.click(wx + int(ww * 0.35), wy + int(wh * 0.45))
+    desktop.click(wx + int(ww * 0.35), wy + int(wh * 0.45))
     time.sleep(0.2)
-    pyautogui.typewrite(best_drive["letter"], interval=0.05)
+    desktop.type_text(best_drive["letter"], interval=0.05)
     time.sleep(0.2)
-    pyautogui.click(wx + int(ww * 0.72), wy + int(wh * 0.88))
+    desktop.click(wx + int(ww * 0.72), wy + int(wh * 0.88))
     return f"Attempted drive {drive_label} selection and Install click for '{game_name}'."
 
 
@@ -438,10 +462,10 @@ def _handle_install_dialog(game_name: str) -> str:
         return f"Please click Install manually in Steam for '{game_name}'."
 
     except ImportError:
-        return _handle_install_dialog_pyautogui(game_name, best_drive)
+        return _handle_install_dialog_by_coordinates(game_name, best_drive)
     except Exception as e:
         print(f"[GameUpdater] ⚠️ pywinauto başarısız: {e}")
-        return _handle_install_dialog_pyautogui(game_name, best_drive)
+        return _handle_install_dialog_by_coordinates(game_name, best_drive)
 
 def _ensure_steam_running(steam_path: Path) -> bool:
     if _is_steam_running():

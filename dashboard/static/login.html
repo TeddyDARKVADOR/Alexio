@@ -153,7 +153,9 @@
   </div>
 
   <script>
-    // Try auto-reconnect with stored device token (set on first QR login)
+    // Try auto-reconnect with stored device token (set on first QR login).
+    // The server now expires these — 30 days absolute, 7 days idle — so a
+    // rejection here is normal and simply means typing the key again.
     (async function() {
       const devTok = localStorage.getItem('jarvis_device_token');
       if (!devTok) return;
@@ -166,13 +168,16 @@
         });
         const d = await r.json();
         if (d.ok && d.token) {
-          sessionStorage.setItem('jarvis_key', d.key);
-          sessionStorage.setItem('jarvis_token', d.token);
+          // The session secret is 256 random bits minted by the server, never
+          // derived from the six characters — see dashboard/auth.py.
+          sessionStorage.setItem('jarvis_secret', d.secret);
+          sessionStorage.setItem('jarvis_token',  d.token);
           location.replace('/');
           return;
         }
       } catch (_) {}
-      // Device token rejected (server restarted) — clear it and show normal form
+      // Device token rejected (expired, revoked, or the server restarted) —
+      // clear it and show the normal form.
       localStorage.removeItem('jarvis_device_token');
       document.getElementById('reconnecting').style.display = 'none';
     })();
@@ -189,26 +194,31 @@
     async function doLogin() {
       const key = inp.value.trim();
       if (key.length < 6) { shake(); return; }
-      let data;
+      let data, status = 0;
       try {
         const r = await fetch('/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ pin: key })
         });
-        data = await r.json();
+        status = r.status;
+        data   = await r.json();
       } catch (e) {
         document.getElementById('err').textContent = 'Connection error';
         shake(); return;
       }
       if (data.ok && data.token) {
-        sessionStorage.setItem('jarvis_key', key);
-        sessionStorage.setItem('jarvis_token', data.token);
+        // Note what is NOT stored: the key just typed. It paired this browser
+        // and is now spent; the encryption key is the server's random secret.
+        sessionStorage.setItem('jarvis_secret', data.secret);
+        sessionStorage.setItem('jarvis_token',  data.token);
         location.href = '/';
       } else {
         inp.value = '';
         inp.focus();
-        document.getElementById('err').textContent = 'Invalid or expired key';
+        document.getElementById('err').textContent =
+          status === 429 ? 'Too many attempts — wait a minute'
+                         : 'Invalid or expired key';
         shake();
       }
     }

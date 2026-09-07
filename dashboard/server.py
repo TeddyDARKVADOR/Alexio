@@ -1,9 +1,45 @@
 """
-dashboard/server.py — JARVIS Local HTTP Dashboard
+dashboard/server.py — the remote dashboard: a phone on the same network drives
+Alexio through a browser.
 
-Plain HTTP on port 8000 (no SSL warnings, no firewall issues).
-Security at the application layer: AES-256-CBC with session-key-derived key.
-CryptoJS is auto-downloaded once and served locally — no CDN needed after that.
+PHASE 06 — WHAT WAS HARDENED AND WHY
+    This is the only part of Alexio that listens on a socket, so it is the only
+    part where a mistake is reachable by someone who is not already sitting at
+    the keyboard. Five things were wrong, and each had the same shape: a control
+    that looked present and was not.
+
+    1. The AES key was SHA-256(six-character PIN ‖ a salt written in this file).
+       Under a billion possibilities, one hash per guess, same salt everywhere.
+       The PIN is now a *pairing* credential only: it is compared, never
+       stretched into a key, and pairing hands back 256 real random bits. See
+       dashboard/auth.py.
+
+    2. Device tokens never expired. Now: thirty days absolute, seven days idle,
+       at most eight paired devices, stored hashed, revocable.
+
+    3. `GET /` returned the full application to anyone who asked, and the page
+       redirected itself to /login in JavaScript if it did not like what it
+       found in sessionStorage. That is a suggestion, not a gate. It is now
+       checked on the server, against an HttpOnly cookie — with the API still
+       requiring the Authorization header, so the cookie can never be used to
+       forge an API call from another site.
+
+    4. The firewall was opened automatically, with elevation: a UAC dialog on
+       Windows, pkexec or sudo on Linux, an admin prompt on macOS. An assistant
+       should not ask for administrator rights as a side effect of starting.
+       It now prints the exact command and leaves the decision alone; setting
+       `dashboard_open_firewall` in config/api_keys.json opts back in, and even
+       then it never elevates.
+
+    5. Nothing counted failed logins, and the CryptoJS bundle was downloaded
+       from a CDN at import time and served with no integrity check at all.
+       Both are fixed below.
+
+WHAT IS STILL TRUE, AND SHOULD BE SAID
+    Payload encryption over plain HTTP does not protect against someone who
+    watched the pairing. Over TLS — which is generated on first run and is the
+    default — it is defence in depth. Over HTTP it is a second lock on the same
+    door. The dashboard prefers HTTPS for that reason.
 
 Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 """
@@ -11,17 +47,19 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import json
 import re
 import secrets
 import socket
-import string
-import time
 from pathlib import Path
+
+from dashboard.auth import CredentialStore, Session
 
 _DEPS_OK = False
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+    from fastapi.responses import (HTMLResponse, JSONResponse, FileResponse,
+                                   RedirectResponse, Response)
     import uvicorn
     _DEPS_OK = True
 except ImportError:
@@ -35,10 +73,15 @@ try:
 except Exception:
     pass
 
-BASE_DIR    = Path(__file__).resolve().parent.parent
-STATIC_DIR  = Path(__file__).parent / "static"
-PORT        = 8000
+BASE_DIR      = Path(__file__).resolve().parent.parent
+STATIC_DIR    = Path(__file__).parent / "static"
+PORT          = 8000
 MAX_UPLOAD_MB = 500
+NAV_COOKIE    = "alexio_nav"
+
+# A queue with no bound is a memory leak with an authenticated trigger: a phone
+# holding the send button while the assistant is busy would grow it forever.
+MAX_QUEUED_COMMANDS = 200
 
 
 def _make_uploads_dir() -> Path:
@@ -58,25 +101,26 @@ def _make_uploads_dir() -> Path:
 
 UPLOADS_DIR = _make_uploads_dir()
 
-def _get_gemini_key() -> str | None:
-    try:
-        import json as _json
-        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
-            return _json.load(f).get("gemini_api_key")
-    except Exception:
-        return None
 
-_KEY_CHARS = [c for c in (string.ascii_uppercase + string.digits)
-              if c not in ('O', 'I', 'L', '0', '1')]
+def _setting(name: str, default=None):
+    """Read one key out of config/api_keys.json.
+
+    Anything that changes the security posture — opening a firewall port, in
+    practice — has to be something the user turned on, not something the code
+    decided. Missing file, missing key, unreadable JSON: the default wins, and
+    every default here is the conservative one.
+    """
+    try:
+        with open(BASE_DIR / "config" / "api_keys.json", "r", encoding="utf-8") as f:
+            return json.load(f).get(name, default)
+    except Exception:
+        return default
+
 
 # ── AES-256-CBC ───────────────────────────────────────────────────────────────
-_AES_SALT = b'JARVIS-DASHBOARD-v1'
-
-
-def _derive_key(session_key: str) -> bytes:
-    """SHA-256(sessionKey‖salt) → 32-byte AES-256 key (microseconds, no PBKDF2 needed)."""
-    return hashlib.sha256(session_key.encode('utf-8') + _AES_SALT).digest()
-
+#
+# The key is now 32 bytes straight out of the credential store — no derivation,
+# no salt, nothing to precompute. What is left here is only transport.
 
 def _decrypt_cbc(aes_key: bytes, enc_b64: str) -> str:
     """Decrypt base64(IV[16] ‖ ciphertext) with AES-256-CBC + PKCS7."""
@@ -87,240 +131,154 @@ def _decrypt_cbc(aes_key: bytes, enc_b64: str) -> str:
     dec      = Cipher(algorithms.AES(aes_key), modes.CBC(iv)).decryptor()
     padded   = dec.update(ct) + dec.finalize()
     unpadder = sym_pad.PKCS7(128).unpadder()
-    return (unpadder.update(padded) + unpadder.finalize()).decode('utf-8')
+    return (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
 
 
-# ── CryptoJS (auto-download once, served locally) ─────────────────────────────
+# ── CryptoJS — cached locally, and checked ────────────────────────────────────
+#
+# The old version downloaded this from a CDN and served whatever came back, then
+# fell back to redirecting the browser to the CDN if the download had failed.
+# Both are ways of letting a third party put JavaScript on a page that holds the
+# session key. The hash below is the published Subresource Integrity digest for
+# crypto-js 4.2.0 on cdnjs, verified against the copy in this repository on
+# 2026-09-07. A file that does not match it is not served — offline is a better
+# outcome than running an unknown script.
+
 _CRYPTOJS_CDN  = ("https://cdnjs.cloudflare.com/ajax/libs/"
                   "crypto-js/4.2.0/crypto-js.min.js")
 _CRYPTOJS_FILE = STATIC_DIR / "crypto-js.min.js"
+_CRYPTOJS_SHA512 = ("a+SUDuwNzXDvz4XrIcXHuCf089/iJAoN4lmrXJg18XnduKK6YlDHNRalv"
+                    "4yd1N40OKI80tFidF+rqTFKGPoWFQ==")
 
 
-def _ensure_network_access(port: int) -> None:
-    """Cross-platform, best-effort: open port in the OS firewall for LAN access.
+def _digest_ok(data: bytes) -> bool:
+    return secrets.compare_digest(
+        base64.b64encode(hashlib.sha512(data).digest()).decode(), _CRYPTOJS_SHA512
+    )
 
-    Runs in a background thread — never blocks uvicorn startup.
 
-    Windows : writes a .bat file, runs it elevated via Windows ShellExecuteW
-              (native UAC dialog, guaranteed to appear). One-time setup.
-    macOS   : osascript admin dialog if the Application Firewall is on.
-    Linux   : pkexec GUI → sudo -n → prints manual command as fallback.
+def _ensure_crypto_js() -> bool:
+    """Make sure the local CryptoJS copy is the one we expect.
+
+    Called from serve(), not at import: a module that reaches for the network
+    when it is merely imported cannot be tested offline, and turns `import
+    dashboard.server` into an outbound connection nobody asked for.
     """
-    import sys, subprocess, os, tempfile, threading
-
-    # ── Windows ──────────────────────────────────────────────────────────────
-    if sys.platform == "win32":
-        import ctypes, time
-
-        port_rule = f"JARVIS Dashboard Port {port}"
-        prog_rule  = "JARVIS Dashboard Python"
-        py_exe     = sys.executable
-
-        def _netsh_rule_exists(name: str) -> bool:
-            try:
-                r = subprocess.run(
-                    ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                return r.returncode == 0 and "No rules match" not in r.stdout
-            except Exception:
-                return False
-
-        def _network_is_public() -> bool:
-            try:
-                r = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                     "(Get-NetConnectionProfile | "
-                     "Where-Object {$_.NetworkCategory -eq 'Public'} | "
-                     "Measure-Object).Count"],
-                    capture_output=True, text=True, timeout=6,
-                )
-                return r.stdout.strip() not in ("", "0")
-            except Exception:
-                return False
-
-        need_port    = not _netsh_rule_exists(port_rule)
-        need_prog    = not _netsh_rule_exists(prog_rule)
-        need_private = _network_is_public()
-
-        if not need_port and not need_prog and not need_private:
-            return  # already fully configured
-
-        # Build a .bat file — netsh + powershell, runs fast when elevated
-        bat_lines = ["@echo off"]
-        if need_private:
-            bat_lines.append(
-                'powershell -NoProfile -NonInteractive -Command "'
-                'Get-NetConnectionProfile | '
-                "Where-Object {$_.NetworkCategory -eq 'Public'} | "
-                'Set-NetConnectionProfile -NetworkCategory Private"'
-            )
-        if need_port:
-            bat_lines.append(
-                f'netsh advfirewall firewall add rule '
-                f'name="{port_rule}" protocol=TCP dir=in '
-                f'localport={port} action=allow'
-            )
-        if need_prog:
-            bat_lines.append(
-                f'netsh advfirewall firewall add rule '
-                f'name="{prog_rule}" dir=in action=allow '
-                f'program="{py_exe}" enable=yes'
-            )
-
-        bat_body = "\r\n".join(bat_lines) + "\r\n"
-        fd, bat_path = tempfile.mkstemp(suffix=".bat", prefix="jarvis_fw_")
-        try:
-            os.write(fd, bat_body.encode("mbcs"))   # Windows cmd.exe expects ANSI
-            os.close(fd)
-        except Exception:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-            return
-
-        # ── Try running directly (succeeds when already admin) ────────────────
-        try:
-            r = subprocess.run(
-                [bat_path], capture_output=True, timeout=8, shell=True
-            )
-            if r.returncode == 0:
-                print(f"[Dashboard] Firewall configured for port {port}.")
-                try:
-                    os.unlink(bat_path)
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
-
-        # ── ShellExecuteW: native UAC elevation (most reliable on Windows) ────
-        # ShellExecuteW with verb "runas" always shows the UAC dialog regardless
-        # of UAC level settings. Non-blocking — uvicorn is already running.
-        print("[Dashboard] One-time network setup required.")
-        print("[Dashboard] >>> A Windows security dialog will appear — click 'Yes' <<<")
-        try:
-            ret = ctypes.windll.shell32.ShellExecuteW(
-                None,       # hwnd  (no parent window)
-                "runas",    # verb  (request elevation)
-                bat_path,   # file  (our .bat)
-                None,       # params
-                None,       # working dir
-                0,          # SW_HIDE (run without a visible cmd window)
-            )
-            if int(ret) > 32:
-                # ShellExecuteW returns immediately; bat finishes in ~1 second.
-                # Sleep briefly so the rules are in place before the first retry.
-                time.sleep(2)
-                print(f"[Dashboard] Network setup complete — port {port} is open.")
-                print("[Dashboard] Refresh your phone browser to connect.")
-            else:
-                print("[Dashboard] Setup was not allowed.")
-                print("[Dashboard] Phone connections may fail until JARVIS is run as Administrator.")
-        except Exception as e:
-            print(f"[Dashboard] Firewall setup error: {e}")
-        finally:
-            # Cleanup after the bat has had time to run
-            def _cleanup(path: str) -> None:
-                time.sleep(5)
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
-            threading.Thread(target=_cleanup, args=(bat_path,), daemon=True).start()
-        return
-
-    # ── macOS ─────────────────────────────────────────────────────────────────
-    if sys.platform == "darwin":
-        fw_ctl = "/usr/libexec/ApplicationFirewall/socketfilterfw"
-        try:
-            r = subprocess.run(
-                [fw_ctl, "--getglobalstate"], capture_output=True, text=True, timeout=5,
-            )
-            if "disabled" in r.stdout.lower():
-                return  # firewall off — nothing to do
-
-            py = sys.executable
-            listed = subprocess.run(
-                [fw_ctl, "--listapps"], capture_output=True, text=True, timeout=5,
-            )
-            if py in listed.stdout:
-                return  # already allowed
-
-            print("[Dashboard] One-time network setup — enter your password in the macOS dialog.")
-            subprocess.run(
-                ["osascript", "-e",
-                 f'do shell script "{fw_ctl} --add {py} && {fw_ctl} --unblockapp {py}"'
-                 f' with administrator privileges'],
-                timeout=60,
-            )
-        except Exception:
-            pass  # macOS firewall is off by default — silent failure is fine
-        return
-
-    # ── Linux ─────────────────────────────────────────────────────────────────
-    def _privileged(cmd: list[str]) -> bool:
-        for prefix in (["pkexec"], ["sudo", "-n"]):
-            try:
-                r = subprocess.run(prefix + cmd, capture_output=True, timeout=30)
-                if r.returncode == 0:
-                    return True
-            except Exception:
-                pass
-        return False
-
-    try:  # ufw
-        r = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=5)
-        if "active" in r.stdout.lower():
-            if _privileged(["ufw", "allow", f"{port}/tcp"]):
-                print(f"[Dashboard] ufw: port {port} allowed.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo ufw allow {port}/tcp")
-            return
-    except FileNotFoundError:
-        pass
-
-    try:  # firewalld
-        r = subprocess.run(
-            ["firewall-cmd", "--state"], capture_output=True, text=True, timeout=5,
-        )
-        if "running" in r.stdout.lower():
-            ok = (_privileged(["firewall-cmd", "--add-port", f"{port}/tcp", "--permanent"])
-                  and _privileged(["firewall-cmd", "--reload"]))
-            if ok:
-                print(f"[Dashboard] firewalld: port {port} allowed.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo firewall-cmd --add-port={port}/tcp --permanent && sudo firewall-cmd --reload")
-            return
-    except FileNotFoundError:
-        pass
-
-    try:  # iptables (not persistent but works until reboot)
-        r = subprocess.run(["iptables", "-L", "INPUT", "-n"], capture_output=True, timeout=5)
-        if r.returncode == 0:
-            if _privileged(["iptables", "-A", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"]):
-                print(f"[Dashboard] iptables: port {port} opened.")
-            else:
-                print(f"[Dashboard] Run manually:  sudo iptables -A INPUT -p tcp --dport {port} -j ACCEPT")
-    except FileNotFoundError:
-        pass  # no iptables means firewall is probably off — nothing to do
-
-
-def _ensure_crypto_js() -> None:
     if _CRYPTOJS_FILE.exists():
-        return
+        if _digest_ok(_CRYPTOJS_FILE.read_bytes()):
+            return True
+        print("[Dashboard] Cached CryptoJS does not match the expected digest — discarding.")
+        try:
+            _CRYPTOJS_FILE.unlink()
+        except Exception:
+            return False
+
     try:
         import urllib.request
         print("[Dashboard] Downloading CryptoJS (one-time setup)…")
-        urllib.request.urlretrieve(_CRYPTOJS_CDN, str(_CRYPTOJS_FILE))
-        print("[Dashboard] CryptoJS cached — will serve locally from now on.")
+        with urllib.request.urlopen(_CRYPTOJS_CDN, timeout=20) as r:
+            data = r.read()
     except Exception as e:
         print(f"[Dashboard] CryptoJS download failed: {e}")
-        print(f"[Dashboard] Encryption will fall back to CDN load on client.")
+        print("[Dashboard] Commands will be sent unencrypted — use the HTTPS URL.")
+        return False
+
+    if not _digest_ok(data):
+        print("[Dashboard] Downloaded CryptoJS failed its integrity check — refusing it.")
+        return False
+
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    _CRYPTOJS_FILE.write_bytes(data)
+    print("[Dashboard] CryptoJS verified and cached — served locally from now on.")
+    return True
 
 
-_ensure_crypto_js()
+# ── firewall: tell, do not take ───────────────────────────────────────────────
+
+def _firewall_hint(first: int, last: int) -> None:
+    """Say what would open the ports, and say it once.
+
+    Both ports at once — the dashboard listens on PORT and, when TLS is on, on
+    PORT+1 as well. Two separate prompts for the same decision is how a warning
+    becomes wallpaper.
+
+    The previous version wrote a .bat file and ran it through ShellExecuteW with
+    the "runas" verb — a UAC prompt raised by an assistant that was only meant
+    to start listening. On Linux it tried pkexec and then sudo; on macOS an
+    osascript admin dialog. Three platforms, one mistake: a program that starts
+    by asking to be root teaches the user to say yes to that question.
+
+    So this prints. Setting `dashboard_open_firewall: true` in
+    config/api_keys.json makes it try the command directly — which succeeds when
+    Alexio is already running with the rights and fails cleanly when it is not.
+    It never elevates.
+    """
+    import sys, subprocess
+
+    opt_in = bool(_setting("dashboard_open_firewall", False))
+    rule   = "JARVIS Dashboard"
+
+    def _run(cmd: list[str]) -> bool:
+        """Run it as we are. Never with elevation, never through a helper that
+        prompts — if the rights are not already there, the answer is the printed
+        command, not a dialog."""
+        try:
+            return subprocess.run(cmd, capture_output=True, timeout=15).returncode == 0
+        except Exception:
+            return False
+
+    def _tell(manual: str) -> None:
+        print("[Dashboard] The phone cannot reach this machine until the firewall "
+              f"allows ports {first}-{last}. To allow them:")
+        print(f"[Dashboard]   {manual}")
+
+    if sys.platform == "win32":
+        ports  = f"{first}-{last}"
+        manual = (f'netsh advfirewall firewall add rule name="{rule}" '
+                  f"protocol=TCP dir=in localport={ports} action=allow")
+        try:    # already there? then there is nothing to say
+            r = subprocess.run(
+                ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and "No rules match" not in r.stdout:
+                return
+        except Exception:
+            pass
+        if opt_in and _run(["netsh", "advfirewall", "firewall", "add", "rule",
+                            f"name={rule}", "protocol=TCP", "dir=in",
+                            f"localport={ports}", "action=allow"]):
+            print(f"[Dashboard] Firewall rule added for ports {ports}.")
+            return
+        _tell(f"{manual}    (in an Administrator prompt)")
+        return
+
+    if sys.platform == "darwin":
+        print("[Dashboard] If the macOS firewall blocks the connection, allow "
+              "Python in System Settings › Network › Firewall.")
+        return
+
+    # Linux — name the firewall that is actually running, not all three.
+    for probe, active, cmd, manual in (
+        (["ufw", "status"], "active",
+         ["ufw", "allow", f"{first}:{last}/tcp"],
+         f"sudo ufw allow {first}:{last}/tcp"),
+        (["firewall-cmd", "--state"], "running",
+         ["firewall-cmd", "--add-port", f"{first}-{last}/tcp", "--permanent"],
+         f"sudo firewall-cmd --add-port={first}-{last}/tcp --permanent "
+         f"&& sudo firewall-cmd --reload"),
+    ):
+        try:
+            r = subprocess.run(probe, capture_output=True, text=True, timeout=5)
+        except Exception:      # not installed, or not answering — try the next
+            continue
+        if active not in r.stdout.lower():
+            continue
+        if opt_in and _run(cmd):
+            print(f"[Dashboard] Ports {first}-{last} allowed.")
+            return
+        _tell(manual)
+        return
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -457,18 +415,15 @@ class DashboardServer:
 
     def __init__(self):
         self._ip                          = _local_ip()
-        self._tokens: set[str]            = set()
-        self._token_keys: dict[str, str]  = {}   # auth_token → session_key
-        self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
+        self._creds                       = CredentialStore()
         self._clients: set[WebSocket]     = set()
         self._history: list[dict]         = []
-        self._command_queue               = asyncio.Queue()
+        self._command_queue               = asyncio.Queue(maxsize=MAX_QUEUED_COMMANDS)
         self._wake_callback               = None
         self._connect_callback            = None
-        self._pending_keys: dict[str, float] = {}
-        self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
-        self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
+        self._phone_audio_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
+        self._uploads_root                = UPLOADS_DIR.resolve()
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
         self.app                          = self._build_app()
@@ -476,11 +431,8 @@ class DashboardServer:
     # ── one-time key management ───────────────────────────────────────────
 
     def new_key(self, expiry_secs: int = 600) -> str:
-        now = time.time()
-        self._pending_keys = {k: v for k, v in self._pending_keys.items() if v > now}
-        key = ''.join(secrets.choice(_KEY_CHARS) for _ in range(6))
-        self._pending_keys[key] = now + expiry_secs
-        return key
+        """The six characters shown in the desktop UI and encoded in the QR."""
+        return self._creds.new_pairing_key(expiry_secs)
 
     @staticmethod
     def _ssl_enabled() -> bool:
@@ -496,20 +448,6 @@ class DashboardServer:
         if self._ssl_enabled():
             return f"{self._ip}:{PORT + 1}"
         return f"{self._ip}:{PORT}"
-
-    def _aes_key(self, session_key: str) -> bytes:
-        if session_key not in self._aes_cache:
-            self._aes_cache[session_key] = _derive_key(session_key)
-        return self._aes_cache[session_key]
-
-    def _decrypt(self, token: str, enc_b64: str) -> str | None:
-        sk = self._token_keys.get(token)
-        if not sk:
-            return None
-        try:
-            return _decrypt_cbc(self._aes_key(sk), enc_b64)
-        except Exception:
-            return None
 
     # ── callbacks ────────────────────────────────────────────────────────
 
@@ -533,64 +471,176 @@ class DashboardServer:
                 dead.add(ws)
         self._clients -= dead
 
+    # ── command intake ───────────────────────────────────────────────────
+
+    def _enqueue(self, text: str) -> bool:
+        """Drop rather than block when the queue is full.
+
+        The alternative is awaiting a put() inside a request handler, which
+        holds the connection open and lets one impatient client stall the
+        others — R-07 in a place that is easy to miss because nothing here
+        looks blocking.
+        """
+        try:
+            self._command_queue.put_nowait(text)
+        except asyncio.QueueFull:
+            return False
+        if self._wake_callback:
+            self._wake_callback()
+        return True
+
     # ── FastAPI app ───────────────────────────────────────────────────────
 
     def _build_app(self) -> "FastAPI":
         app = FastAPI(docs_url=None, redoc_url=None)
 
-        def _auth(req: Request) -> bool:
-            tok = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
-            return bool(tok) and tok in self._tokens
+        # Whether this response is going out over TLS is a property of the
+        # request, not of the process: the certificate is generated inside
+        # serve(), *after* this function runs, so reading it once here would
+        # have marked every cookie non-Secure on the very first launch — the
+        # one run where it matters most.
+        def _is_secure(req: "Request") -> bool:
+            return req.url.scheme in ("https", "wss")
 
-        # serve CryptoJS from local cache, fallback to CDN redirect
+        # Content-Security-Policy is the one that earns its place: it stops the
+        # page loading script from anywhere but this server, which is what makes
+        # the pinned CryptoJS copy meaningful. The pages use inline <script> and
+        # inline handlers, so 'unsafe-inline' has to stay until they are split
+        # out — but no external origin can contribute code either way.
+        _CSP = ("default-src 'self'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; "
+                "media-src 'self' blob:; "
+                "connect-src 'self' ws: wss:; "
+                "object-src 'none'; base-uri 'none'; "
+                "frame-ancestors 'none'; form-action 'self'")
+
+        @app.middleware("http")
+        async def security_headers(request: "Request", call_next):
+            response = await call_next(request)
+            response.headers["Content-Security-Policy"]   = _CSP
+            response.headers["X-Content-Type-Options"]    = "nosniff"
+            response.headers["X-Frame-Options"]           = "DENY"
+            # The QR link carries the pairing PIN in its query string. Without
+            # this, the first outbound request from that page would put the PIN
+            # in someone else's logs.
+            response.headers["Referrer-Policy"]           = "no-referrer"
+            response.headers["Permissions-Policy"]        = "geolocation=(), camera=()"
+            response.headers.setdefault("Cache-Control", "no-store")
+            if _is_secure(request):
+                response.headers["Strict-Transport-Security"] = "max-age=31536000"
+            return response
+
+        def _bearer(req: "Request") -> str:
+            return req.headers.get("authorization", "").removeprefix("Bearer ").strip()
+
+        def _auth(req: "Request") -> Session | None:
+            """API authentication — the Authorization header, and nothing else.
+
+            Deliberately does not accept the navigation cookie. A cross-site
+            page can make a browser send a cookie; it cannot make it set a
+            header. Keeping the two apart is what makes every endpoint below
+            CSRF-proof without a single token in a form.
+            """
+            return self._creds.session_for_bearer(_bearer(req))
+
+        def _who(req: "Request") -> str:
+            return req.client.host if req.client else "?"
+
+        def _note_failure(req: "Request") -> None:
+            if self._creds.throttle.fail(_who(req)):
+                burned = self._creds.burn_pairing_keys()
+                if burned:
+                    print(f"[Dashboard] Repeated bad logins — {burned} pending key(s) "
+                          f"discarded. Press 'Remote Control' for a new one.")
+
+        def _set_nav_cookie(req: "Request", resp: "Response", nav: str) -> None:
+            resp.set_cookie(
+                NAV_COOKIE, nav,
+                httponly=True,          # unreachable from JavaScript, so an XSS
+                                        # in the page cannot walk off with it
+                samesite="strict",      # never attached to a cross-site request
+                secure=_is_secure(req),
+                path="/",
+                max_age=12 * 3600,
+            )
+
+        def _connected(what: str) -> None:
+            if self._connect_callback:
+                self._connect_callback()
+            asyncio.create_task(self.broadcast({"type": "sys", "text": what}))
+
+        # ── static ───────────────────────────────────────────────────────────
+
         @app.get("/static/crypto.js")
         async def serve_crypto():
-            if _CRYPTOJS_FILE.exists():
+            """Served only if the local copy matches the pinned digest.
+
+            No CDN redirect fallback: sending the browser to fetch script from
+            somewhere else is precisely the thing the CSP above forbids, and a
+            page that silently loses its encryption is worse than one that says
+            NO ENC in the corner — which is what the client does when this 404s.
+            """
+            if _CRYPTOJS_FILE.exists() and _digest_ok(_CRYPTOJS_FILE.read_bytes()):
                 return FileResponse(str(_CRYPTOJS_FILE),
                                     media_type="application/javascript")
-            from fastapi.responses import RedirectResponse
-            return RedirectResponse(_CRYPTOJS_CDN)
+            return JSONResponse({"error": "crypto bundle unavailable"}, status_code=503)
 
         @app.get("/login", response_class=HTMLResponse)
         async def login_page():
             return HTMLResponse(self._login_html)
 
         @app.get("/", response_class=HTMLResponse)
-        async def index():
-            # Auth is handled client-side via sessionStorage bearer token.
-            # Server-side header auth can't work here because browser navigations
-            # don't send custom headers (location.href doesn't carry Authorization).
+        async def index(req: Request):
+            """Gated on the server, against an HttpOnly cookie.
+
+            The old version served this page to anyone and let its own
+            JavaScript decide whether to redirect. Anything that ships to the
+            browser before the check is a check that did not happen.
+            """
+            if self._creds.session_for_nav(req.cookies.get(NAV_COOKIE, "")) is None:
+                return RedirectResponse("/login", status_code=303)
             html = (self._app_html
                     .replace("__IP__", self._ip)
                     .replace("__PORT__", str(PORT)))
             return HTMLResponse(html)
 
+        # ── pairing ──────────────────────────────────────────────────────────
+
         @app.post("/login")
         async def login(req: Request):
-            body    = await req.json()
+            wait = self._creds.throttle.retry_after(_who(req))
+            if wait > 0:
+                return JSONResponse(
+                    {"ok": False, "error": "Too many attempts"},
+                    status_code=429, headers={"Retry-After": str(int(wait) + 1)},
+                )
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"ok": False}, status_code=400)
+
             entered = str(body.get("pin", "")).strip().upper()
-            now     = time.time()
-            if entered in self._pending_keys and self._pending_keys[entered] > now:
-                del self._pending_keys[entered]          # one-time use
-                tok = secrets.token_urlsafe(32)
-                self._tokens.add(tok)
-                self._token_keys[tok] = entered
-                self._aes_key(entered)                   # pre-derive & cache
-                if self._connect_callback:
-                    self._connect_callback()
-                asyncio.create_task(self.broadcast(
-                    {"type": "sys", "text": "Remote connection established."}
-                ))
-                # Bearer token in response body — no cookies needed (works on any browser/HTTP)
-                return JSONResponse({"ok": True, "token": tok})
-            return JSONResponse({"ok": False, "error": "Invalid or expired key"},
-                                status_code=401)
+            if not self._creds.redeem_pairing_key(entered):
+                _note_failure(req)
+                return JSONResponse({"ok": False, "error": "Invalid or expired key"},
+                                    status_code=401)
+
+            self._creds.throttle.clear(_who(req))
+            bearer, nav, session = self._creds.open_session()
+            _connected("Remote connection established.")
+            resp = JSONResponse({"ok": True, "token": bearer, "secret": session.secret})
+            _set_nav_cookie(req, resp, nav)
+            return resp
 
         @app.get("/auto-login")
-        async def auto_login(key: str = ""):
+        async def auto_login(req: Request, key: str = ""):
             """QR code target — validates one-time key, creates session, redirects phone."""
-            now = time.time()
-            if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
+            if self._creds.throttle.retry_after(_who(req)) > 0 or \
+                    not self._creds.redeem_pairing_key(key.strip().upper()):
+                if key:
+                    _note_failure(req)
                 return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
@@ -602,21 +652,15 @@ class DashboardServer:
 <p>Press <strong style="color:#dde3ed">Remote Control</strong> in JARVIS to get a new QR code.</p>
 </div></body></html>""")
 
-            del self._pending_keys[key]
-            tok     = secrets.token_urlsafe(32)
-            dev_tok = secrets.token_urlsafe(32)
-            self._tokens.add(tok)
-            self._token_keys[tok] = key
-            self._aes_key(key)
-            self._device_sessions[dev_tok] = {"session_key": key}
+            self._creds.throttle.clear(_who(req))
+            bearer, nav, session = self._creds.open_session()
+            device = self._creds.pair_device(session)
+            _connected("Remote connection established via QR code.")
 
-            if self._connect_callback:
-                self._connect_callback()
-            asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Remote connection established via QR code."}
-            ))
-
-            return HTMLResponse(f"""<!DOCTYPE html>
+            # The three values below are server-minted url-safe tokens and
+            # base64 — no user input reaches this template, which is why it can
+            # be interpolated at all.
+            resp = HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
   body{{background:#07090f;color:#dde3ed;font-family:sans-serif;
@@ -625,78 +669,107 @@ class DashboardServer:
 </style></head>
 <body>
 <script>
-  sessionStorage.setItem('jarvis_token','{tok}');
-  sessionStorage.setItem('jarvis_key','{key}');
-  localStorage.setItem('jarvis_device_token','{dev_tok}');
+  sessionStorage.setItem('jarvis_token','{bearer}');
+  sessionStorage.setItem('jarvis_secret','{session.secret}');
+  localStorage.setItem('jarvis_device_token','{device}');
   setTimeout(function(){{location.replace('/')}},400);
 </script>
 <p>Connecting to JARVIS…</p>
 </body></html>""")
+            _set_nav_cookie(req, resp, nav)
+            return resp
 
         @app.post("/api/device-login")
         async def device_login_ep(req: Request):
-            """Return a fresh auth token for a previously paired device token."""
+            """Return a fresh session for a previously paired device token."""
+            wait = self._creds.throttle.retry_after(_who(req))
+            if wait > 0:
+                return JSONResponse({"ok": False}, status_code=429,
+                                    headers={"Retry-After": str(int(wait) + 1)})
             try:
                 body = await req.json()
             except Exception:
                 return JSONResponse({"ok": False}, status_code=400)
-            dev_tok = (body.get("device_token") or "").strip()
-            if not dev_tok or dev_tok not in self._device_sessions:
+
+            opened = self._creds.open_session_for_device(
+                (body.get("device_token") or "").strip())
+            if opened is None:
+                _note_failure(req)
                 return JSONResponse({"ok": False}, status_code=401)
-            session_key = self._device_sessions[dev_tok]["session_key"]
-            tok = secrets.token_urlsafe(32)
-            self._tokens.add(tok)
-            self._token_keys[tok] = session_key
-            self._aes_key(session_key)
-            if self._connect_callback:
-                self._connect_callback()
-            asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Known device reconnected automatically."}
-            ))
-            return JSONResponse({"ok": True, "token": tok, "key": session_key})
+
+            bearer, nav, session = opened
+            _connected("Known device reconnected automatically.")
+            resp = JSONResponse({"ok": True, "token": bearer, "secret": session.secret})
+            _set_nav_cookie(req, resp, nav)
+            return resp
 
         @app.post("/api/revoke-devices")
         async def revoke_devices(req: Request):
             """Invalidate all persistent device tokens (admin action)."""
-            if not _auth(req):
+            if _auth(req) is None:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            count = len(self._device_sessions)
-            self._device_sessions.clear()
-            return JSONResponse({"ok": True, "revoked": count})
+            return JSONResponse({"ok": True, "revoked": self._creds.revoke_devices()})
+
+        @app.get("/api/sessions")
+        async def sessions_ep(req: Request):
+            """What credentials are outstanding right now.
+
+            Expiry that cannot be observed is expiry nobody believes in.
+            """
+            if _auth(req) is None:
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse(self._creds.stats())
+
+        # ── commands ─────────────────────────────────────────────────────────
 
         @app.post("/api/command")
         async def command(req: Request):
-            if not _auth(req):
+            session = _auth(req)
+            if session is None:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            body  = await req.json()
-            token = req.headers.get("authorization", "").removeprefix("Bearer ").strip()
-            enc   = body.get("enc", "")
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"error": "Bad request"}, status_code=400)
+            enc = body.get("enc", "")
             if enc:
-                text = self._decrypt(token, enc)
-                if text is None:
+                try:
+                    text = _decrypt_cbc(session.key_bytes(), enc)
+                except Exception:
                     return JSONResponse({"error": "Decryption failed"}, status_code=400)
             else:
                 text = (body.get("text") or "").strip()
-            if text:
-                await self._command_queue.put(text)
-                if self._wake_callback:
-                    self._wake_callback()
+            if text and not self._enqueue(text):
+                return JSONResponse({"error": "Busy — command dropped"}, status_code=503)
             return JSONResponse({"ok": True})
 
         @app.post("/api/wake")
         async def wake_ep(req: Request):
-            if not _auth(req):
+            if _auth(req) is None:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             if self._wake_callback:
                 self._wake_callback()
             return JSONResponse({"ok": True})
 
+        @app.post("/api/ws-ticket")
+        async def ws_ticket(req: Request):
+            """Trade the bearer token for a thirty-second, single-use ticket.
+
+            A WebSocket handshake from a browser cannot carry an Authorization
+            header, so something has to go in the query string. A ticket that is
+            dead before the log file is rotated is a much smaller thing to leave
+            there than a twelve-hour session token.
+            """
+            ticket = self._creds.new_ticket(_bearer(req))
+            if ticket is None:
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return JSONResponse({"ticket": ticket})
+
         # ── Phone mic real-time audio → Gemini Live ──────────────────────────
 
         @app.websocket("/ws/phone-audio")
-        async def phone_audio_ws(websocket: WebSocket, token: str = ""):
-            tok = token.strip()
-            if not tok or tok not in self._tokens:
+        async def phone_audio_ws(websocket: WebSocket, ticket: str = ""):
+            if self._creds.redeem_ticket(ticket.strip()) is None:
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
@@ -723,17 +796,35 @@ class DashboardServer:
 
         def _safe_filename(raw: str) -> str:
             name = Path(raw).name                          # strip path components
-            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(". ")
+            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(". ")
             return name or "upload"
+
+        def _inside_uploads(name: str) -> Path | None:
+            """Resolve a name against the uploads folder, or refuse.
+
+            The character filter above is already strict, but it is a denylist,
+            and a denylist is a claim about every input nobody has thought of
+            yet. This is the check that does not depend on being clever: after
+            resolving symlinks and `..`, is the result still under the folder?
+            """
+            try:
+                candidate = (self._uploads_dir / name).resolve()
+            except Exception:
+                return None
+            if candidate == self._uploads_root or not candidate.is_relative_to(self._uploads_root):
+                return None
+            return candidate
 
         if _UPLOAD_OK:
             @app.post("/api/upload")
             async def upload_file(req: Request, file: UploadFile = FastAPIFile(...)):
-                if not _auth(req):
+                if _auth(req) is None:
                     return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
                 safe = _safe_filename(file.filename or "upload")
-                dest = self._uploads_dir / safe
+                dest = _inside_uploads(safe)
+                if dest is None:
+                    return JSONResponse({"error": "Invalid filename"}, status_code=400)
                 stem, suffix = Path(safe).stem, Path(safe).suffix
                 counter = 1
                 while dest.exists():
@@ -781,7 +872,7 @@ class DashboardServer:
 
         @app.get("/api/files")
         async def list_files(req: Request):
-            if not _auth(req):
+            if _auth(req) is None:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             files = []
             try:
@@ -796,21 +887,27 @@ class DashboardServer:
             return JSONResponse({"files": files})
 
         @app.get("/uploads/{filename}")
-        async def download_file(filename: str, token: str = ""):
-            # Auth via query param — browser <a download> can't send custom headers
-            tok = token.strip()
-            if not tok or tok not in self._tokens:
+        async def download_file(req: Request, filename: str):
+            """Authenticated by the navigation cookie, not a token in the URL.
+
+            A download is a navigation: `<a download>` sends cookies and cannot
+            send headers. The old version put the session token in the query
+            string of every file link, which put it in the browser history and
+            anything that logs URLs. The cookie cannot be used to *read* the
+            response from another origin, so nothing is lost.
+            """
+            if (self._creds.session_for_nav(req.cookies.get(NAV_COOKIE, "")) is None
+                    and _auth(req) is None):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            safe = re.sub(r'[/\\]', '', filename)
-            path = self._uploads_dir / safe
-            if not path.exists() or not path.is_file():
+            path = _inside_uploads(_safe_filename(filename))
+            if path is None or not path.exists() or not path.is_file():
                 return JSONResponse({"error": "Not found"}, status_code=404)
-            return FileResponse(str(path), filename=safe)
+            return FileResponse(str(path), filename=path.name)
 
         @app.websocket("/ws")
-        async def ws_ep(websocket: WebSocket, token: str = ""):
-            tok = token.strip()
-            if not tok or tok not in self._tokens:
+        async def ws_ep(websocket: WebSocket, ticket: str = ""):
+            session = self._creds.redeem_ticket(ticket.strip())
+            if session is None:
                 await websocket.close(code=4001)
                 return
             await websocket.accept()
@@ -823,13 +920,18 @@ class DashboardServer:
             try:
                 while True:
                     data = await websocket.receive_json()
-                    if data.get("type") == "command":
-                        enc = data.get("enc", "")
-                        t   = self._decrypt(tok, enc) if enc else (data.get("text") or "").strip()
-                        if t:
-                            await self._command_queue.put(t)
-                            if self._wake_callback:
-                                self._wake_callback()
+                    if data.get("type") != "command":
+                        continue
+                    enc = data.get("enc", "")
+                    if enc:
+                        try:
+                            text = _decrypt_cbc(session.key_bytes(), enc)
+                        except Exception:
+                            continue
+                    else:
+                        text = (data.get("text") or "").strip()
+                    if text:
+                        self._enqueue(text)
             except WebSocketDisconnect:
                 pass
             finally:
@@ -845,7 +947,6 @@ class DashboardServer:
         User types IP:8001 → Chrome tries https → self-signed cert warning → accept once → done."""
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
         ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
@@ -859,12 +960,16 @@ class DashboardServer:
             print("[Dashboard] Run:  pip install fastapi 'uvicorn[standard]' cryptography")
             return
 
-        # Firewall setup runs in a thread — uvicorn starts immediately,
-        # no waiting for UAC dialogs or subprocess timeouts.
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT)
+        loop = asyncio.get_running_loop()
+
+        # Both of these touch the network or a subprocess, so neither belongs on
+        # the event loop (R-07). Neither blocks startup either — uvicorn is up
+        # before they finish.
+        loop.run_in_executor(None, _ensure_crypto_js)
+        loop.run_in_executor(None, _firewall_hint, PORT, PORT + 1)
 
         # Generate the TLS pair on first run so no private key ships in the repo.
-        _ensure_certs()
+        await loop.run_in_executor(None, _ensure_certs)
 
         use_ssl  = self._ssl_enabled()
         ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
@@ -880,5 +985,7 @@ class DashboardServer:
 
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
+        if not use_ssl:
+            print("[Dashboard] Plain HTTP: anyone on this network can read the pairing.")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
         await uvicorn.Server(cfg).serve()

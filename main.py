@@ -80,6 +80,7 @@ from memory.config_manager     import (
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
+from core                      import tool_policy
 from core                      import audio_devices
 from core                      import telemetry
 from core                      import ai
@@ -997,6 +998,39 @@ class JarvisLive:
             output_sample_rate=RECEIVE_SAMPLE_RATE,
         )
 
+    def _sync_handlers(self, args: dict) -> dict:
+        """The tools that are a plain synchronous call, as zero-argument callables.
+
+        They were 18 near-identical `elif` branches. Turning them into a table is
+        not about the line count — it is what lets one gate sit in front of all
+        of them. A callable can be handed to core/confirm.py to run *later*, if a
+        human presses the button; an inline `await` in an elif cannot be handed
+        to anything.
+
+        The tools that are not here — memory, undo, vision, the monitors,
+        shutdown — are genuinely different: they are async, or they touch state
+        on this object, or they return something other than a string.
+        """
+        ui = self.ui
+        return {
+            "open_app":          lambda: open_app(parameters=args, response=None, player=ui),
+            "weather_report":    lambda: weather_action(parameters=args, player=ui),
+            "browser_control":   lambda: browser_control(parameters=args, player=ui),
+            "file_controller":   lambda: file_controller(parameters=args, player=ui),
+            "send_message":      lambda: send_message(parameters=args, response=None, player=ui, session_memory=None),
+            "reminder":          lambda: reminder(parameters=args, response=None, player=ui),
+            "youtube_video":     lambda: youtube_video(parameters=args, response=None, player=ui),
+            "computer_settings": lambda: computer_settings(parameters=args, response=None, player=ui),
+            "desktop_control":   lambda: desktop_control(parameters=args, player=ui),
+            "code_helper":       lambda: code_helper(parameters=args, player=ui, speak=self.speak),
+            "dev_agent":         lambda: dev_agent(parameters=args, player=ui, speak=self.speak),
+            "file_processor":    lambda: file_processor(parameters=args, player=ui, speak=self.speak),
+            "computer_control":  lambda: computer_control(parameters=args, player=ui),
+            "game_updater":      lambda: game_updater(parameters=args, player=ui, speak=self.speak),
+            "flight_finder":     lambda: flight_finder(parameters=args, player=ui),
+            "web_search":        lambda: web_search_action(parameters=args, player=ui),
+        }
+
     async def _execute_tool(self, fc: voice.ToolCall) -> voice.ToolResult:
         name = fc.name
         args = dict(fc.args or {})
@@ -1016,11 +1050,51 @@ class JarvisLive:
             return voice.ToolResult(id=fc.id, name=name,
                                     result={"result": "ok", "silent": True})
 
-        loop   = asyncio.get_event_loop()
+        # get_running_loop(), pas get_event_loop() : le second est déprécié depuis
+        # 3.12 et lève une RuntimeError en 3.14 quand aucune boucle n'est
+        # attachée au thread courant. Ici on est déjà dans une coroutine, donc
+        # il y a forcément une boucle qui tourne — autant la demander telle quelle.
+        loop   = asyncio.get_running_loop()
         result = "Done."
 
         try:
-            if name == "recall_memory":
+            # ── the gate, once, in front of everything that goes through the
+            # table ──────────────────────────────────────────────────────────
+            # This is the join that did not exist. core/confirm.py issued a
+            # token nobody asked for; ToolSpec carried an `irreversible` flag
+            # nothing read; and this dispatch consulted neither. Now one call
+            # decides, and it decides from the arguments — because
+            # `file_controller` reading a file and `file_controller` deleting a
+            # folder are the same tool name (R-04, R-05).
+            #
+            # A parked call returns the sentence and nothing runs. The handler
+            # is kept as a callable so core/confirm.py can run it later, off the
+            # Qt thread, only if a human presses CONFIRM.
+            if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
+                args["file_path"] = self.ui.current_file
+
+            handler = self._sync_handlers(args).get(name)
+
+            if handler is not None:
+                parked = tool_policy.gate(name, args, handler)
+                if parked is not None:
+                    result = parked
+                else:
+                    r = await loop.run_in_executor(None, handler)
+                    result = r or "Done."
+                    if name == "web_search":
+                        # Mirror results to the on-screen content panel
+                        _mode = args.get("mode", "search")
+                        if r and not r.startswith("No results") and not r.startswith("Search failed"):
+                            _query = args.get("query") or ", ".join(args.get("items", []))
+                            _label = f"{_mode.upper()} — {_query[:38]}" if _query else _mode.upper()
+                            self.ui.show_content(_label, r)
+                    elif name == "open_app" and not r:
+                        result = f"Opened {args.get('app_name')}."
+                    elif name == "send_message" and not r:
+                        result = f"Message sent to {args.get('receiver')}."
+
+            elif name == "recall_memory":
                 # Local file search: no network, no second model. Kept out of
                 # the executor deliberately — it is a dictionary scan over a few
                 # hundred short strings, and a thread hop would cost more than
@@ -1035,34 +1109,6 @@ class JarvisLive:
                               ) if items else "I have not changed anything I can undo yet."
                 else:
                     result = await loop.run_in_executor(None, undo_stack.undo_last)
-
-            elif name == "open_app":
-                r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
-                result = r or f"Opened {args.get('app_name')}."
-
-            elif name == "weather_report":
-                r = await loop.run_in_executor(None, lambda: weather_action(parameters=args, player=self.ui))
-                result = r or "Weather delivered."
-
-            elif name == "browser_control":
-                r = await loop.run_in_executor(None, lambda: browser_control(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "file_controller":
-                r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "send_message":
-                r = await loop.run_in_executor(None, lambda: send_message(parameters=args, response=None, player=self.ui, session_memory=None))
-                result = r or f"Message sent to {args.get('receiver')}."
-
-            elif name == "reminder":
-                r = await loop.run_in_executor(None, lambda: reminder(parameters=args, response=None, player=self.ui))
-                result = r or "Reminder set."
-
-            elif name == "youtube_video":
-                r = await loop.run_in_executor(None, lambda: youtube_video(parameters=args, response=None, player=self.ui))
-                result = r or "Done."
 
             elif name == "screen_process":
                 import time as _t_mod
@@ -1099,52 +1145,6 @@ class JarvisLive:
                 self.ui.stop_camera_stream()
                 result = "Camera closed."
 
-            elif name == "computer_settings":
-                r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
-                result = r or "Done."
-
-            elif name == "desktop_control":
-                r = await loop.run_in_executor(None, lambda: desktop_control(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "code_helper":
-                r = await loop.run_in_executor(None, lambda: code_helper(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
-
-            elif name == "dev_agent":
-                r = await loop.run_in_executor(None, lambda: dev_agent(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
-
-            elif name == "web_search":
-                r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
-                result = r or "Done."
-                # Mirror results to the on-screen content panel
-                _mode = args.get("mode", "search")
-                if r and not r.startswith("No results") and not r.startswith("Search failed"):
-                    _query = args.get("query") or ", ".join(args.get("items", []))
-                    _label = f"{_mode.upper()} — {_query[:38]}" if _query else _mode.upper()
-                    self.ui.show_content(_label, r)
-            elif name == "file_processor":
-                if not args.get("file_path") and self.ui.current_file:
-                    args["file_path"] = self.ui.current_file
-                r = await loop.run_in_executor(
-                    None,
-                    lambda: file_processor(parameters=args, player=self.ui, speak=self.speak)
-                )
-                result = r or "Done."
-
-            elif name == "computer_control":
-                r = await loop.run_in_executor(None, lambda: computer_control(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "game_updater":
-                r = await loop.run_in_executor(None, lambda: game_updater(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
-
-            elif name == "flight_finder":
-                r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
-                result = r or "Done."
-
             elif name == "system_status":
                 r = await loop.run_in_executor(None, get_system_status)
                 result = str(r)
@@ -1163,19 +1163,19 @@ class JarvisLive:
                     result = "Specify action (add/remove/list) and a topic."
 
             elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                async def _do_shutdown():
-                    await self._save_session_summary()
-                    if self.session:
-                        try:
-                            await self.session.send_text(
-                                "Say a brief natural goodbye to the user.")
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.5)
-                    import os as _os
-                    _os._exit(0)
-                asyncio.create_task(_do_shutdown())
+                # This ends in os._exit(0), and it used to fire the moment the
+                # model asked — no gate, no button, nothing to disagree with.
+                # It cannot go through the table above because the work is
+                # asynchronous, so the gate is applied here by hand: the
+                # callable core/confirm.py stores schedules the coroutine back
+                # onto this loop from the confirm worker thread.
+                def _start_shutdown() -> str:
+                    self.ui.write_log("SYS: Shutdown confirmed.")
+                    asyncio.run_coroutine_threadsafe(self._do_shutdown(), loop)
+                    return "Shutting down."
+
+                parked = tool_policy.gate(name, args, _start_shutdown)
+                result = parked if parked is not None else _start_shutdown()
 
             else:
                 if self._plugin_registry.has(name):
@@ -1198,6 +1198,25 @@ class JarvisLive:
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
         return voice.ToolResult(id=fc.id, name=name, result=result)
 
+    async def _do_shutdown(self) -> None:
+        """Say goodbye, write the session summary, then leave.
+
+        Lifted out of `_execute_tool` so the confirmation gate has something to
+        hold: core/confirm.py stores a plain callable and runs it on a worker
+        thread if the user presses CONFIRM, which cannot be a coroutine defined
+        inside a branch that has already returned.
+        """
+        await self._save_session_summary()
+        if self.session:
+            try:
+                await self.session.send_text(
+                    "Say a brief natural goodbye to the user.")
+            except Exception:
+                pass
+        await asyncio.sleep(1.5)
+        import os as _os
+        _os._exit(0)
+
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
@@ -1205,7 +1224,7 @@ class JarvisLive:
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
@@ -1495,7 +1514,7 @@ class JarvisLive:
         time_str = datetime.now().strftime("%H:%M")
 
         # Start fetching news immediately — runs in parallel while phase 1 plays
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
 
         await asyncio.sleep(0.3)
@@ -1775,7 +1794,7 @@ class JarvisLive:
     # ── main loop ───────────────────────────────────────────────────────────
 
     async def run(self):
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
         self._reconnect_event = asyncio.Event()
 
         # ── Wire the shared core services to the interface ───────────────────

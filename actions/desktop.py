@@ -9,15 +9,10 @@ import platform
 from pathlib import Path
 from datetime import datetime
 
-try:
-    import pyautogui
-    _PYAUTOGUI = True
-# Not ImportError — pyautogui connects to an X display at import time and raises
-# DisplayConnectionError when there is none. See actions/computer_control.py.
-except Exception as _e:
-    print(f"[desktop] pyautogui unavailable ({type(_e).__name__}) — "
-          "desktop key control disabled.")
-    _PYAUTOGUI = False
+# Aliased because this module is itself called `desktop`, and the sandbox below
+# has a local `desktop` holding a *path*. Two different things with one name in
+# generated code is a bug waiting for a slow afternoon.
+from core import desktop as core_desktop
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -64,8 +59,21 @@ def _build_sandbox() -> dict:
         "os_path": os.path,  
     }
 
-    if _PYAUTOGUI:
-        sandbox["pyautogui"] = pyautogui
+    # R-09 reaches generated code too. Handing the model `pyautogui` taught it
+    # to write `pyautogui.hotkey(...)`, which under Wayland types into XWayland
+    # windows and nowhere else while reporting success. `input` is the facade,
+    # narrowed to the calls that make sense inside a sandbox: no screenshot (it
+    # returns bytes nothing here can use) and no drag.
+    if core_desktop.capabilities()["input"].available:
+        sandbox["input"] = type("input", (), {
+            "type_text":   staticmethod(core_desktop.type_text),
+            "key":         staticmethod(core_desktop.key),
+            "hotkey":      staticmethod(core_desktop.hotkey),
+            "click":       staticmethod(core_desktop.click),
+            "move_to":     staticmethod(core_desktop.move_to),
+            "scroll":      staticmethod(core_desktop.scroll),
+            "screen_size": staticmethod(core_desktop.screen_size),
+        })()
 
     if _OS == "Windows":
         try:
@@ -114,10 +122,8 @@ def _ask_gemini_for_desktop_action(task: str) -> str:
     os_specific = ""
     if _OS == "Windows":
         os_specific = "- ctypes (Windows API calls, read-only)\n- winreg (registry READ only)"
-    elif _OS == "Darwin":
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
     else:
-        os_specific = "- subprocess is NOT available; use pyautogui or Path only"
+        os_specific = "- subprocess is NOT available; use input or Path only"
 
     prompt = f"""You are a desktop automation assistant.
 Current OS: {_OS}
@@ -125,7 +131,16 @@ Desktop path: {desktop}
 
 Generate safe Python code to accomplish the task below.
 Allowed modules ONLY:
-- pyautogui (mouse, keyboard — if needed)
+- input (keyboard and mouse — if needed). It has exactly these calls:
+    input.type_text(text)          input.key("enter")
+    input.hotkey("ctrl", "c")      input.click(x=None, y=None, button="left")
+    input.move_to(x, y)            input.scroll(clicks)
+    input.screen_size() -> (w, h)
+  Key names: "enter", "escape", "tab", "delete", "space", "up"/"down"/"left"/
+  "right", "f1".."f12", "pageup", "pagedown", "home", "end", "volumeup",
+  "volumedown", "volumemute", or any single character. "super" is the
+  Windows/Command key — never write "win" or "command".
+  There is NO pyautogui. Do not import it and do not call it.
 - pathlib.Path (file/folder inspection only, no deletion)
 - shutil.copy2, shutil.copytree, shutil.disk_usage (NO move, NO rmtree)
 - os_path (os.path equivalent, read-only)

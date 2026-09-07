@@ -41,7 +41,7 @@ NEW_MODULES = [
     "core.ai.gemini", "core.ai.local", "core.ai.anthropic", "core.ai.openai",
     "core.voice", "core.voice.gemini_live",
     "core.desktop", "core.desktop.linux", "core.desktop.windows",
-    "core.desktop.macos", "core.desktop.portal",
+    "core.desktop.macos", "core.desktop.portal", "core.desktop.input",
     "core.local", "core.local.reflex", "core.local.intents", "core.local.speech",
     "core.telemetry",
 ]

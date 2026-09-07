@@ -5,6 +5,9 @@ import re
 import time
 from pathlib import Path
 
+from core import desktop
+from core.undo import push_undo
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -236,15 +239,63 @@ Code for {file_path}:"""
             raise RateLimitError(str(e))
         raise
 
+def _project_python(project_dir: Path) -> Path | None:
+    """The interpreter that belongs to this project, creating its venv once.
+
+    WHY THIS EXISTS
+        Every pip call here used to be `sys.executable -m pip install` — which
+        is *Alexio's own interpreter*. A user asking for a to-do app was
+        installing packages into the assistant's environment, and
+        `_try_auto_install` picked the package name out of a traceback produced
+        by code the model had just written. A model that hallucinates an import
+        of `reqeusts` makes Alexio pip-install `reqeusts`.
+
+        Confirming "build me a project" is not consent to change the
+        environment Alexio itself runs in. A venv per project costs about three
+        seconds once and removes the whole class.
+
+    Returns None when a venv cannot be made — and the caller must then refuse to
+    install rather than falling back to sys.executable, which is the behaviour
+    this function exists to end (R-12).
+    """
+    venv_dir = project_dir / ".venv"
+    python = (venv_dir / ("Scripts" if sys.platform == "win32" else "bin")
+              / ("python.exe" if sys.platform == "win32" else "python"))
+    if python.exists():
+        return python
+
+    try:
+        import venv
+
+        print(f"[DevAgent] 🧪 Creating a venv for this project: {venv_dir}")
+        venv.EnvBuilder(with_pip=True, clear=False).create(str(venv_dir))
+    except Exception as e:
+        # ensurepip is missing on Debian-family system Pythons without
+        # python3-venv, and read-only project directories exist.
+        print(f"[DevAgent] ⚠️ Could not create a project venv: "
+              f"{type(e).__name__}: {e}")
+        return None
+
+    return python if python.exists() else None
+
+
 def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     if not dependencies:
         return "No external dependencies."
+
+    python = _project_python(project_dir)
+    if python is None:
+        return ("Skipped installing "
+                f"{', '.join(dependencies)}: this project has no virtual "
+                f"environment and Alexio will not install into its own. "
+                f"Fix: install python3-venv, or pip install them yourself in "
+                f"the project folder.")
 
     to_install = []
     for dep in dependencies:
         pkg_name = re.split(r"[>=<!]", dep)[0].strip()
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "show", pkg_name],
+            [str(python), "-m", "pip", "show", pkg_name],
             capture_output=True, text=True
         )
         if result.returncode != 0:
@@ -255,10 +306,10 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     if not to_install:
         return f"All dependencies already installed: {', '.join(dependencies)}"
 
-    print(f"[DevAgent] 📦 Installing: {to_install}")
+    print(f"[DevAgent] 📦 Installing into the project venv: {to_install}")
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install"] + to_install,
+            [str(python), "-m", "pip", "install"] + to_install,
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=120, cwd=str(project_dir)
@@ -296,8 +347,14 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
     try:
         parts = run_command.split()
-        if parts[0].lower() == "python":
-            parts[0] = sys.executable
+        if parts[0].lower() in ("python", "python3", "py"):
+            # The project's interpreter, not Alexio's — so generated code sees
+            # the packages that were installed for it and nothing else. Falling
+            # back to sys.executable is deliberate here and not in
+            # _install_dependencies: running in the wrong interpreter produces a
+            # visible ImportError, installing into the wrong one is silent.
+            python = _project_python(project_dir)
+            parts[0] = str(python) if python else sys.executable
 
         result = subprocess.run(
             parts,
@@ -326,7 +383,16 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
         return f"Run error: {e}"
 
 def _try_auto_install(error_output: str, project_dir: Path) -> bool:
-    """ModuleNotFoundError varsa eksik paketi otomatik kurmaya çalışır."""
+    """Install the package a ModuleNotFoundError names — into the project venv.
+
+    The package name comes from a traceback produced by code the model wrote
+    minutes ago, so it is not a name any human chose. Against a real index that
+    is a typosquat waiting to happen: a hallucinated `import reqeusts` used to
+    become `pip install reqeusts` straight into Alexio's own environment.
+
+    Scoping it to the project venv does not make the name trustworthy — it makes
+    the blast radius the project folder, which the user can delete.
+    """
     pattern = re.compile(
         r"No module named ['\"]([a-zA-Z0-9_\-\.]+)['\"]", re.IGNORECASE
     )
@@ -334,11 +400,16 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
     if not match:
         return False
 
+    python = _project_python(project_dir)
+    if python is None:
+        print("[DevAgent] ⚠️ No project venv — not installing into Alexio's own.")
+        return False
+
     pkg = match.group(1).replace("_", "-").split(".")[0]
-    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
+    print(f"[DevAgent] 🔧 Auto-installing missing package into the project venv: {pkg}")
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", pkg],
+            [str(python), "-m", "pip", "install", pkg],
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=60, cwd=str(project_dir)
@@ -465,7 +536,19 @@ def _build_project(
     proj_name    = project_name or plan.get("project_name", "jarvis_project")
     proj_name    = re.sub(r"[^\w\-]", "_", proj_name)
     project_dir  = PROJECTS_DIR / proj_name
+    existed      = project_dir.exists()
     project_dir.mkdir(parents=True, exist_ok=True)
+
+    # R-05 applies to the half of this that *can* be taken back. The pip
+    # installs and the execution cannot, which is why dev_agent is gated at all
+    # (core/tool_policy.py) — but a project folder Alexio created is reversible,
+    # so "undo" should reach it. Only when it is new: a folder that was already
+    # there holds work nobody asked us to bin.
+    if not existed:
+        push_undo(
+            f"project '{proj_name}'",
+            lambda d=project_dir: (desktop.trash(d), f"Moved {d.name} to the trash.")[1],
+        )
 
     files        = plan.get("files", [])
     entry_point  = plan.get("entry_point", "main.py")

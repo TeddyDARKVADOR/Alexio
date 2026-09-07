@@ -226,11 +226,6 @@ def set_wallpaper(path: str | Path) -> None:
 # ── input injection ──────────────────────────────────────────────────────────
 
 def input_capability() -> Capability:
-    if not _on_macos():
-        return Capability("input", False, "pyautogui", "macOS only")
-    try:
-        import pyautogui  # noqa: F401
-        return Capability("input", True, "pyautogui/Quartz",
-                          "needs Accessibility permission in System Settings")
-    except Exception:
-        return Capability("input", False, "none", "pip install pyautogui")
+    """Delegated to core/desktop/input.py, which owns this surface everywhere."""
+    from . import input as _input
+    return _input.capability_for("macos")

@@ -28,18 +28,19 @@ import time
 from pathlib import Path
 
 
+# `except Exception`, pas `except ImportError` : cv2 charge des bibliothèques
+# natives (libGL, libglib) et lève une ImportError *étrangère* — parfois une
+# OSError — quand elles manquent, et mss cherche un display à l'import.
+# Une garde étroite laisse l'exception tuer l'import du module entier.
 try:
     import cv2
     _CV2 = True
-except ImportError:
+except Exception:
     _CV2 = False
 
-try:
-    import mss
-    import mss.tools
-    _MSS = True
-except ImportError:
-    _MSS = False
+# mss était importé ici pour `_capture_screen`, qui passe par core/desktop depuis
+# la phase 04 — c'est le backend qui décide entre le portail et mss, et lui seul.
+# L'import qui restait ne servait plus qu'à mettre un flag que personne ne lisait.
 
 try:
     import PIL.Image

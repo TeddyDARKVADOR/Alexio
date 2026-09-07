@@ -1,5 +1,4 @@
 #computer_control.py
-import io
 import json
 import platform
 import re
@@ -15,26 +14,13 @@ import time
 import random
 from pathlib import Path
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE    = 0.05
-    _PYAUTOGUI = True
-# Not ImportError. On Linux, pyautogui opens an X display at import time and
-# raises Xlib.error.DisplayConnectionError when there isn't one — over SSH, on a
-# TTY, in a systemd unit, in CI. That is not an ImportError, so the narrow guard
-# let it escape and killed the import of this module, and with it all of main.py:
-# the assistant could not start at all rather than losing one optional feature.
-except Exception as _e:
-    print(f"[computer_control] pyautogui unavailable ({type(_e).__name__}) — "
-          "keyboard and mouse control disabled.")
-    _PYAUTOGUI = False
-
-try:
-    import pyperclip
-    _PYPERCLIP = True
-except ImportError:
-    _PYPERCLIP = False
+# R-09 : le clavier et la souris passent par core/desktop, jamais par pyautogui.
+# Ce module en faisait 19 appels directs. Sous Wayland ils atteignaient les seules
+# fenêtres XWayland — c'est-à-dire presque rien sur GNOME 49 — et réussissaient
+# quand même, ce qui est la pire des issues : l'assistant annonçait une frappe
+# que personne n'avait reçue. La façade choisit le portail RemoteDesktop là-bas,
+# SendInput sur Windows, Quartz sur macOS, XTEST sous X11.
+from core import desktop
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -82,9 +68,17 @@ def _safe_screenshot_path(requested: str | None) -> Path:
         pass
     return fallback
 
-def _require_pyautogui():
-    if not _PYAUTOGUI:
-        raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
+def _require_input():
+    """Refuse before acting, with the reason and the fix.
+
+    `desktop.capabilities()["input"]` already carries both — it knows whether the
+    answer is "pip install pyautogui", "install xdg-desktop-portal-gnome", or
+    "grant Accessibility permission". Restating it here would be a second copy
+    that goes stale.
+    """
+    cap = desktop.capabilities()["input"]
+    if not cap.available:
+        raise RuntimeError(f"Keyboard and mouse control unavailable: {cap.detail}")
 
 _FIRST_NAMES = [
     "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Drew", "Quinn",
@@ -162,104 +156,128 @@ def _user_profile() -> dict:
     return {}
 
 def _type(text: str, interval: float = 0.03) -> str:
-    _require_pyautogui()
+    _require_input()
     time.sleep(0.3)
-    pyautogui.typewrite(text, interval=interval)
+    desktop.type_text(text, interval=interval)
     return f"Typed: {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
 def _smart_type(text: str, clear_first: bool = True) -> str:
-    _require_pyautogui()
+    _require_input()
     if clear_first:
         _clear_field()
         time.sleep(0.1)
 
-    if len(text) > 20 and _PYPERCLIP:
-        pyperclip.copy(text)
-        time.sleep(0.1)
-        paste_key = "command" if _get_os() == "mac" else "ctrl"
-        pyautogui.hotkey(paste_key, "v")
-        return f"Smart-typed (clipboard): {text[:60]}{'…' if len(text) > 60 else ''}"
+    # Above 20 characters, paste beats typing — but it costs the user whatever
+    # they had copied, so what was there is put back afterwards.
+    if len(text) > 20:
+        try:
+            saved = _clipboard_read()
+            desktop.clipboard_set(text)
+            time.sleep(0.1)
+            desktop.hotkey("super" if _get_os() == "mac" else "ctrl", "v")
+            time.sleep(0.1)
+            if saved:
+                desktop.clipboard_set(saved)
+            return f"Smart-typed (clipboard): {text[:60]}{'…' if len(text) > 60 else ''}"
+        except Exception:
+            pass          # no clipboard here — type it out instead
 
-    pyautogui.typewrite(text, interval=0.04)
+    desktop.type_text(text, interval=0.04)
     return f"Smart-typed: {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
-    _require_pyautogui()
+    _require_input()
     if x is not None and y is not None:
-        pyautogui.click(x, y, button=button, clicks=clicks)
+        desktop.click(int(x), int(y), button=button, clicks=clicks)
         return f"{'Double-c' if clicks == 2 else 'C'}licked ({x}, {y}) [{button}]"
-    pyautogui.click(button=button, clicks=clicks)
+    desktop.click(button=button, clicks=clicks)
     return f"Clicked at current position [{button}]"
 
 
 def _hotkey(*keys) -> str:
-    _require_pyautogui()
-    pyautogui.hotkey(*keys)
+    _require_input()
+    desktop.hotkey(*keys)
     return f"Hotkey: {'+'.join(keys)}"
 
 
 def _press(key: str) -> str:
-    _require_pyautogui()
-    pyautogui.press(key)
+    _require_input()
+    desktop.key(key)
     return f"Pressed: {key}"
 
 
 def _scroll(direction: str = "down", amount: int = 3) -> str:
-    _require_pyautogui()
-    vertical   = direction in ("up", "down")
-    clicks     = amount if direction in ("up", "right") else -amount
-    pyautogui.scroll(clicks) if vertical else pyautogui.hscroll(clicks)
+    _require_input()
+    clicks = amount if direction in ("up", "right") else -amount
+    if direction in ("up", "down"):
+        desktop.scroll(clicks)
+    else:
+        desktop.hscroll(clicks)
     return f"Scrolled {direction} ×{amount}"
 
 
 def _move(x: int, y: int, duration: float = 0.3) -> str:
-    _require_pyautogui()
-    pyautogui.moveTo(x, y, duration=duration)
+    _require_input()
+    desktop.move_to(x, y, duration=duration)
     return f"Mouse → ({x}, {y})"
 
 
 def _drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5) -> str:
-    _require_pyautogui()
-    pyautogui.moveTo(x1, y1, duration=0.2)
-    pyautogui.dragTo(x2, y2, duration=duration, button="left")
+    _require_input()
+    desktop.move_to(x1, y1, duration=0.2)
+    desktop.drag_to(x2, y2, duration=duration, button="left")
     return f"Dragged ({x1},{y1}) → ({x2},{y2})"
 
 
+def _clipboard_read() -> str:
+    """Read the clipboard, or "" when this machine has no way to.
+
+    Separate from _clipboard_get because _smart_type needs "did it work" and the
+    tool needs a sentence for the user.
+    """
+    try:
+        return desktop.clipboard_get() or ""
+    except Exception:
+        return ""
+
+
 def _clipboard_get() -> str:
-    if _PYPERCLIP:
-        return pyperclip.paste()
-    _hotkey("ctrl", "c")
-    time.sleep(0.2)
-    return "(copied — pyperclip unavailable for read)"
+    try:
+        return desktop.clipboard_get()
+    except Exception as e:
+        _hotkey("ctrl", "c")
+        time.sleep(0.2)
+        return f"(copied — the clipboard cannot be read here: {e})"
 
 
 def _clipboard_paste(text: str) -> str:
-    if _PYPERCLIP:
-        pyperclip.copy(text)
-        time.sleep(0.1)
-        _require_pyautogui()
-        paste_key = "command" if _get_os() == "mac" else "ctrl"
-        pyautogui.hotkey(paste_key, "v")
-        return f"Pasted: {text[:60]}{'…' if len(text) > 60 else ''}"
-    return "pyperclip not available"
+    try:
+        desktop.clipboard_set(text)
+    except Exception as e:
+        return f"Clipboard unavailable: {e}"
+    time.sleep(0.1)
+    _require_input()
+    desktop.hotkey("super" if _get_os() == "mac" else "ctrl", "v")
+    return f"Pasted: {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
 def _screenshot(save_path: str | None = None) -> str:
-    _require_pyautogui()
+    # Not the input facade: capture is its own surface, and under Wayland it is
+    # the portal that answers — pyautogui.screenshot() would have returned a
+    # black rectangle there without failing.
     path = _safe_screenshot_path(save_path)
-    img  = pyautogui.screenshot()
-    img.save(str(path))
+    data, _mime = desktop.screenshot()
+    path.write_bytes(data)
     return f"Screenshot saved: {path}"
 
 
 def _clear_field() -> str:
-    _require_pyautogui()
-    select_key = "command" if _get_os() == "mac" else "ctrl"
-    pyautogui.hotkey(select_key, "a")
+    _require_input()
+    desktop.hotkey("super" if _get_os() == "mac" else "ctrl", "a")
     time.sleep(0.1)
-    pyautogui.press("delete")
+    desktop.key("delete")
     return "Field cleared"
 
 def _focus_window(title: str) -> str:
@@ -321,12 +339,8 @@ def _screen_find(description: str) -> tuple[int, int] | None:
     try:
         from core import ai
 
-        _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
-        buf   = io.BytesIO()
-        img.save(buf, format="PNG")
-        image_bytes = buf.getvalue()
+        image_bytes, _mime = desktop.screenshot()
+        w, h = desktop.screen_size()
 
         prompt = (
             f"This is a screenshot of a {w}×{h} pixel screen. "

@@ -102,11 +102,15 @@ def _has_error(output: str) -> bool:
 
 
 def _take_screenshot() -> Path | None:
+    # Through core/desktop: under Wayland `pyautogui.screenshot()` succeeded and
+    # returned a black rectangle, which is the worst possible failure for a
+    # screenshot whose whole purpose is to be sent to a model for debugging.
     try:
-        import pyautogui
+        from core import desktop
+
         screenshot_path = Path.home() / "Desktop" / f"jarvis_debug_{int(time.time())}.png"
-        screenshot = pyautogui.screenshot()
-        screenshot.save(str(screenshot_path))
+        data, _mime = desktop.screenshot()
+        screenshot_path.write_bytes(data)
         print(f"[Code] 📸 Screenshot: {screenshot_path}")
         return screenshot_path
     except Exception as e:
@@ -554,6 +558,24 @@ def code_helper(
     if action == "auto":
         action = _detect_intent(description, file_path, code)
         print(f"[Code] 🤖 Auto-detected: {action}")
+
+        # `auto` reached the dispatch un-gated because it had not resolved to
+        # anything yet. Now it has, so it re-enters the same gate — otherwise
+        # "run this" spelled as a description would be the one way around the
+        # rule, which is worse than having no rule at all.
+        #
+        # Same shape as actions/computer_settings.py: the module that resolves
+        # the intent is the module that has to ask.
+        from core import tool_policy
+
+        parked = tool_policy.gate(
+            "code_helper", {**p, "action": action},
+            lambda: code_helper({**p, "action": action}, response=response,
+                                player=player, session_memory=session_memory,
+                                speak=speak),
+        )
+        if parked is not None:
+            return parked
 
     if action == "write":
         return _write_action(description, language, output_path, player)

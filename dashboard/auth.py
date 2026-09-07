@@ -1,0 +1,371 @@
+"""
+dashboard/auth.py — the credentials the remote dashboard hands out, and how
+long each one is worth something.
+
+WHY THIS IS A SEPARATE FILE
+    Everything here is arithmetic on clocks and random bytes. None of it needs
+    FastAPI, a socket, or a browser, so none of it should be reachable only
+    through one. Pulled out, the whole credential lifecycle can be tested in a
+    few milliseconds with no server running — which is the only way anyone will
+    ever check that a device token really does stop working after thirty days.
+
+WHAT WAS WRONG BEFORE
+    Three things, and they compounded:
+
+    1. The AES key was SHA-256(six-character PIN ‖ a salt hard-coded in the
+       source). Thirty-one usable characters to the sixth power is about 2^29.7
+       — under a billion. One SHA-256 per guess, no stretching, and a salt that
+       is the same on every install, means anyone who captured a single
+       encrypted command could recover the key on a laptop over lunch. The
+       encryption badge in the UI said ENCRYPTED and meant almost nothing.
+
+    2. Device tokens never expired. A phone paired once by QR code kept a
+       permanent credential in localStorage. Lose the phone, lend it, sell it —
+       the credential travels with it, and the only way to cut it was to
+       restart Alexio.
+
+    3. Nothing counted failed attempts, so the PIN could be ground down at
+       whatever rate the network allowed for the whole ten minutes it lived.
+
+    The fix for (1) is not a better hash. It is to stop deriving a key from a
+    six-character string at all: the PIN pairs a device *once*, and pairing
+    hands back a real 256-bit secret. The PIN's job is to be short enough to
+    type, and it is now only ever compared, never stretched into a key.
+
+WHAT IT DOES NOT DEFEND AGAINST
+    Someone already on the LAN who watches the pairing itself. Over TLS — which
+    the dashboard sets up on first run — they cannot. Over plain HTTP they see
+    the secret go past exactly as they would see the bearer token, and the
+    payload encryption buys nothing against them. That is worth saying plainly
+    rather than implying otherwise with a badge.
+
+WHY NOT ROTATE THE DEVICE TOKEN ON EVERY USE
+    Considered and rejected. Rotation's real benefit is that a stolen token
+    used in parallel with the real device makes one of the two fail, which
+    *reveals* the theft — but only to something watching for it, and nothing
+    here is. What it reliably does produce is a phone stranded on a lost
+    response, and a grace window whose bookkeeping is easy to get subtly wrong.
+    Absolute expiry, idle expiry, a cap, and a revoke button cover the actual
+    threat — a credential outliving the trust that created it — without any of
+    that.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import secrets
+import string
+import time
+from dataclasses import dataclass, field
+
+# ── how long each kind of credential is worth something ──────────────────────
+#
+# Every one of these is an upper bound on damage, so each is set from a question
+# about the worst case rather than from convenience.
+
+PAIRING_TTL   = 600           # 10 min — the PIN is on screen; it dies with the QR
+SESSION_TTL   = 12 * 3600     # a bearer token, sliding: 12 h of *inactivity*
+SESSION_MAX   = 7 * 86400     # …but never more than a week, however active
+DEVICE_TTL    = 30 * 86400    # a paired phone: one month, then type the PIN again
+DEVICE_IDLE   = 7 * 86400     # a phone not seen for a week has probably moved on
+TICKET_TTL    = 30            # a WebSocket ticket only has to survive one connect
+MAX_DEVICES   = 8             # more paired phones than any one person has
+
+# ── throttling ───────────────────────────────────────────────────────────────
+#
+# Only *failures* count. A correct PIN must never eat into anyone's budget, or
+# a phone reconnecting on a flaky network locks itself out.
+
+FAIL_LIMIT    = 5             # per address, per window
+FAIL_WINDOW   = 60.0
+BURN_LIMIT    = 20            # failures across all addresses before…
+BURN_WINDOW   = 300.0         # …every pending PIN is thrown away
+
+# The PIN alphabet drops O/I/L/0/1 — six characters read aloud or off a screen
+# have to survive being misread. 31 symbols, six positions: ~2^29.7.
+KEY_CHARS = [c for c in (string.ascii_uppercase + string.digits)
+             if c not in ("O", "I", "L", "0", "1")]
+
+
+def _hash(token: str) -> str:
+    """Tokens are stored hashed, never in the clear.
+
+    They are 256-bit random strings, so this is not about guessing — it is that
+    a credential store dumped by a traceback, a debugger, or a future decision
+    to persist sessions across restarts should not hand anyone a working token.
+    The cost is one SHA-256 per request, which is nothing next to a TLS
+    handshake.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class Session:
+    """One paired browser. `secret` is the AES key material, base64 of 32 random
+    bytes — generated by the server, never derived from anything the user typed."""
+
+    secret:     str
+    created_at: float
+    last_seen:  float
+
+    def key_bytes(self) -> bytes:
+        return base64.b64decode(self.secret)
+
+    def alive(self, now: float) -> bool:
+        return (now - self.last_seen < SESSION_TTL
+                and now - self.created_at < SESSION_MAX)
+
+
+@dataclass
+class Device:
+    """A phone that scanned the QR code once and may come back on its own."""
+
+    secret:     str
+    created_at: float
+    last_seen:  float
+
+    def alive(self, now: float) -> bool:
+        return (now - self.created_at < DEVICE_TTL
+                and now - self.last_seen < DEVICE_IDLE)
+
+
+@dataclass
+class Throttle:
+    """A sliding window of failures per key, plus a global one.
+
+    The global window is the part that matters. Per-address limits are trivial
+    to sidestep from a handful of addresses on a LAN; what actually protects a
+    thirty-bit PIN is noticing that *something* is guessing and taking the PIN
+    away from it.
+    """
+
+    limit:   int   = FAIL_LIMIT
+    window:  float = FAIL_WINDOW
+    _fails:  dict[str, list[float]] = field(default_factory=dict)
+    _global: list[float]            = field(default_factory=list)
+
+    def retry_after(self, who: str, now: float | None = None) -> float:
+        """Seconds the caller must wait, or 0.0 when it may try now."""
+        now  = time.time() if now is None else now
+        hits = [t for t in self._fails.get(who, []) if now - t < self.window]
+        self._fails[who] = hits
+        if len(hits) < self.limit:
+            return 0.0
+        return max(0.0, self.window - (now - hits[0]))
+
+    def fail(self, who: str, now: float | None = None) -> bool:
+        """Record a failed attempt. Returns True when the global threshold has
+        been crossed and every pending PIN should be burned."""
+        now = time.time() if now is None else now
+        self._fails.setdefault(who, []).append(now)
+        self._global = [t for t in self._global if now - t < BURN_WINDOW] + [now]
+        return len(self._global) >= BURN_LIMIT
+
+    def clear(self, who: str) -> None:
+        self._fails.pop(who, None)
+
+
+class CredentialStore:
+    """Every secret the dashboard hands out, and its expiry.
+
+    Deliberately has no idea what HTTP is. It is handed a clock so the tests can
+    move it — a credential lifetime that can only be checked by waiting thirty
+    days is a credential lifetime nobody checks.
+    """
+
+    def __init__(self, clock=time.time):
+        self._clock                       = clock
+        self._pending: dict[str, float]   = {}   # PIN            → expires_at
+        self._sessions: dict[str, Session]= {}   # sha256(bearer) → session
+        self._navs:    dict[str, str]     = {}   # sha256(cookie) → sha256(bearer)
+        self._devices: dict[str, Device]  = {}   # sha256(device) → device
+        self._tickets: dict[str, tuple[str, float]] = {}  # sha256 → (bearer hash, exp)
+        self.throttle                     = Throttle()
+
+    # ── pairing PIN ──────────────────────────────────────────────────────────
+
+    def new_pairing_key(self, ttl: int = PAIRING_TTL) -> str:
+        now = self._clock()
+        self._pending = {k: v for k, v in self._pending.items() if v > now}
+        key = "".join(secrets.choice(KEY_CHARS) for _ in range(6))
+        self._pending[key] = now + ttl
+        return key
+
+    def burn_pairing_keys(self) -> int:
+        """Throw away every PIN currently on offer.
+
+        Called when the failure counter says someone is guessing. The cost is
+        that the user presses the button again; the alternative is letting an
+        attacker keep grinding a live thirty-bit secret for its full lifetime.
+        """
+        count, self._pending = len(self._pending), {}
+        return count
+
+    def redeem_pairing_key(self, entered: str) -> bool:
+        """One use, then gone — a PIN read off a screen may have been read by
+        someone else too."""
+        now = self._clock()
+        exp = self._pending.get(entered)
+        if exp is None or exp <= now:
+            return False
+        del self._pending[entered]
+        return True
+
+    # ── sessions ─────────────────────────────────────────────────────────────
+
+    def open_session(self) -> tuple[str, str, Session]:
+        """Mint a bearer token, a navigation cookie value, and a fresh secret.
+
+        Two tokens rather than one, because they answer different questions.
+        The bearer proves an API call is deliberate: a cross-site page can make
+        the browser send a cookie, but it cannot make it set an Authorization
+        header, so header-only API auth is CSRF-proof by construction. The
+        cookie exists only because a browser navigating to `/` sends no custom
+        headers at all — which is exactly why that page used to be gated in
+        JavaScript, i.e. not gated.
+        """
+        now     = self._clock()
+        bearer  = secrets.token_urlsafe(32)
+        nav     = secrets.token_urlsafe(32)
+        session = Session(secret=base64.b64encode(secrets.token_bytes(32)).decode(),
+                          created_at=now, last_seen=now)
+        self._sessions[_hash(bearer)] = session
+        self._navs[_hash(nav)]        = _hash(bearer)
+        return bearer, nav, session
+
+    def session_for_bearer(self, token: str) -> Session | None:
+        """Resolve a bearer token, sliding its idle window forward."""
+        if not token:
+            return None
+        now = self._clock()
+        s   = self._sessions.get(_hash(token))
+        if s is None:
+            return None
+        if not s.alive(now):
+            self._sessions.pop(_hash(token), None)
+            return None
+        s.last_seen = now
+        return s
+
+    def session_for_nav(self, cookie: str) -> Session | None:
+        """Resolve the navigation cookie. Only ever used to decide whether a
+        page is served or the visitor is sent to /login."""
+        if not cookie:
+            return None
+        bearer_hash = self._navs.get(_hash(cookie))
+        if bearer_hash is None:
+            return None
+        s = self._sessions.get(bearer_hash)
+        if s is None or not s.alive(self._clock()):
+            self._navs.pop(_hash(cookie), None)
+            return None
+        return s
+
+    # ── paired devices ───────────────────────────────────────────────────────
+
+    def pair_device(self, session: Session) -> str:
+        """Remember this phone so it can reconnect without the PIN.
+
+        The cap is enforced by evicting the least recently seen, not by
+        refusing: a person whose ninth device is turned away has no way to tell
+        which of the eight is stale, and will just restart Alexio to clear them
+        all — which is worse than dropping the one nobody has used since March.
+        """
+        now = self._clock()
+        self._prune_devices(now)
+        while len(self._devices) >= MAX_DEVICES:
+            oldest = min(self._devices, key=lambda h: self._devices[h].last_seen)
+            del self._devices[oldest]
+        token = secrets.token_urlsafe(32)
+        self._devices[_hash(token)] = Device(secret=session.secret,
+                                             created_at=now, last_seen=now)
+        return token
+
+    def open_session_for_device(self, token: str) -> tuple[str, str, Session] | None:
+        """Open a new session for a phone that paired earlier.
+
+        The session carries the *device's* secret rather than a fresh one, so a
+        phone coming back can still read what it encrypted with the key already
+        in its storage. Returns the two tokens and the session together: handing
+        them back one at a time through an attribute would be a race the moment
+        two phones reconnect at once.
+        """
+        if not token:
+            return None
+        now = self._clock()
+        self._prune_devices(now)
+        dev = self._devices.get(_hash(token))
+        if dev is None or not dev.alive(now):
+            self._devices.pop(_hash(token), None)
+            return None
+        dev.last_seen        = now
+        bearer, nav, session = self.open_session()
+        session.secret       = dev.secret        # keep the key the phone stored
+        return bearer, nav, session
+
+    def revoke_devices(self) -> int:
+        count, self._devices = len(self._devices), {}
+        return count
+
+    def device_count(self) -> int:
+        self._prune_devices(self._clock())
+        return len(self._devices)
+
+    def _prune_devices(self, now: float) -> None:
+        for h in [h for h, d in self._devices.items() if not d.alive(now)]:
+            del self._devices[h]
+
+    # ── WebSocket tickets ────────────────────────────────────────────────────
+
+    def new_ticket(self, bearer: str) -> str | None:
+        """A thirty-second, single-use stand-in for the bearer token.
+
+        Browsers cannot set headers on a WebSocket handshake, so the token used
+        to live in the query string — where it lands in every proxy log, every
+        `ps` listing of the parent process, and the browser's own history. A
+        ticket in the same place is worth nothing thirty seconds later.
+        """
+        session = self.session_for_bearer(bearer)
+        if session is None:
+            return None
+        ticket = secrets.token_urlsafe(24)
+        self._tickets[_hash(ticket)] = (_hash(bearer), self._clock() + TICKET_TTL)
+        return ticket
+
+    def redeem_ticket(self, ticket: str) -> Session | None:
+        if not ticket:
+            return None
+        now = self._clock()
+        self._tickets = {h: v for h, v in self._tickets.items() if v[1] > now}
+        entry = self._tickets.pop(_hash(ticket), None)     # single use
+        if entry is None:
+            return None
+        session = self._sessions.get(entry[0])
+        if session is None or not session.alive(now):
+            return None
+        session.last_seen = now
+        return session
+
+    # ── housekeeping ─────────────────────────────────────────────────────────
+
+    def prune(self) -> None:
+        """Drop everything that has expired. Called on the cheap paths so the
+        dictionaries cannot grow without bound over a long uptime."""
+        now = self._clock()
+        self._pending = {k: v for k, v in self._pending.items() if v > now}
+        dead = [h for h, s in self._sessions.items() if not s.alive(now)]
+        for h in dead:
+            del self._sessions[h]
+        self._navs = {n: b for n, b in self._navs.items() if b in self._sessions}
+        self._tickets = {h: v for h, v in self._tickets.items() if v[1] > now}
+        self._prune_devices(now)
+
+    def stats(self) -> dict[str, int]:
+        """What the store is holding — for the log line on connect, and for
+        anyone wondering whether expiry actually runs."""
+        self.prune()
+        return {"pending_keys": len(self._pending),
+                "sessions":     len(self._sessions),
+                "devices":      len(self._devices),
+                "tickets":      len(self._tickets)}

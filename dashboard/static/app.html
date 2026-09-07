@@ -154,8 +154,10 @@
 
   <script>
     // ── Auth — bearer token ───────────────────────────────────────────────────
-    const _authToken  = sessionStorage.getItem('jarvis_token');
-    const _sessionKey = sessionStorage.getItem('jarvis_key');
+    // The server already refused to serve this page without a valid navigation
+    // cookie, so this check is a convenience, not the gate it used to be.
+    const _authToken = sessionStorage.getItem('jarvis_token');
+    const _secretB64 = sessionStorage.getItem('jarvis_secret');
 
     if (!_authToken) {
       location.replace('/login');
@@ -168,13 +170,18 @@
     }
 
     // ── AES-256-CBC encryption (CryptoJS) ────────────────────────────────────
-    const _AES_SALT = 'JARVIS-DASHBOARD-v1';
+    // The key is the server's session secret: 32 random bytes, base64. It used
+    // to be SHA-256 of the six-character login key plus a salt written into the
+    // source — under a billion candidates, one hash each, identical on every
+    // install. Nothing is derived here any more; the bytes are used as they came.
     let _aesKey = null;
 
-    function _initCrypto(key) {
-      if (typeof CryptoJS === 'undefined') return false;
-      _aesKey = CryptoJS.SHA256(key + _AES_SALT);
-      return true;
+    function _initCrypto(secretB64) {
+      if (typeof CryptoJS === 'undefined' || !secretB64) return false;
+      try {
+        _aesKey = CryptoJS.enc.Base64.parse(secretB64);
+        return _aesKey.sigBytes === 32;
+      } catch { return false; }
     }
 
     function _encrypt(plaintext) {
@@ -195,7 +202,7 @@
       } catch { return null; }
     }
 
-    const _encReady = _sessionKey ? _initCrypto(_sessionKey) : false;
+    const _encReady = _initCrypto(_secretB64);
     const encBadge  = document.getElementById('enc');
     if (_encReady) { encBadge.className = 'enc-badge on'; }
     else           { encBadge.className = 'enc-badge off'; encBadge.textContent = 'NO ENC'; }
@@ -206,21 +213,44 @@
     const stTxt = document.getElementById('st');
     const wake  = document.getElementById('wake');
 
-    const _wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const _wsUrl   = `${_wsProto}://${location.host}/ws?token=${encodeURIComponent(_authToken)}`;
-    const ws       = new WebSocket(_wsUrl);
+    // A browser cannot put a header on a WebSocket handshake, so something has
+    // to travel in the query string — and a query string ends up in logs and in
+    // history. This asks for a single-use ticket that is dead in 30 seconds
+    // instead of putting the twelve-hour session token there.
+    async function _wsTicket() {
+      const r = await _authFetch('/api/ws-ticket', { method: 'POST' });
+      if (!r.ok) throw new Error('ticket refused');
+      return (await r.json()).ticket;
+    }
 
-    ws.onopen    = () => { sys('Remote session active.'); toast('Connected to JARVIS'); };
-    ws.onclose   = () => sys('Connection lost — refresh to reconnect.');
-    ws.onerror   = () => sys('Connection error.');
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type === 'log')           append(m.speaker, m.text);
-      if (m.type === 'status')        setStatus(m.state);
-      if (m.type === 'wake')          sys('Wake word detected — connecting…');
-      if (m.type === 'sys')           sys(m.text);
-      if (m.type === 'file_received') _onFileReceived(m);
-    };
+    function _wsUrl(path, ticket) {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      return `${proto}://${location.host}${path}?ticket=${encodeURIComponent(ticket)}`;
+    }
+
+    let ws = null;
+    (async function openFeed() {
+      let ticket;
+      try {
+        ticket = await _wsTicket();
+      } catch {
+        sys('Session expired — returning to login.');
+        setTimeout(() => location.replace('/login'), 900);
+        return;
+      }
+      ws = new WebSocket(_wsUrl('/ws', ticket));
+      ws.onopen    = () => { sys('Remote session active.'); toast('Connected to JARVIS'); };
+      ws.onclose   = () => sys('Connection lost — refresh to reconnect.');
+      ws.onerror   = () => sys('Connection error.');
+      ws.onmessage = (e) => {
+        const m = JSON.parse(e.data);
+        if (m.type === 'log')           append(m.speaker, m.text);
+        if (m.type === 'status')        setStatus(m.state);
+        if (m.type === 'wake')          sys('Wake word detected — connecting…');
+        if (m.type === 'sys')           sys(m.text);
+        if (m.type === 'file_received') _onFileReceived(m);
+      };
+    })();
 
     function setStatus(s) {
       if (s === 'active') {
@@ -317,7 +347,7 @@
         if (xhr.status === 200) {
           let savedName = file.name;
           try { savedName = JSON.parse(xhr.responseText).name || file.name; } catch {}
-          const dlUrl = `/uploads/${encodeURIComponent(savedName)}?token=${encodeURIComponent(_authToken)}`;
+          const dlUrl = `/uploads/${encodeURIComponent(savedName)}`;
           if (bar)  { bar.style.width = '100%'; bar.style.background = 'var(--green)'; }
           if (st)   { st.textContent = '✓'; st.className = 'fc-status done'; }
           if (lbl)  lbl.textContent = 'Sent';
@@ -347,7 +377,7 @@
 
     // File received by another WebSocket client (e.g., second open tab)
     function _onFileReceived(m) {
-      const dlUrl = `/uploads/${encodeURIComponent(m.name)}?token=${encodeURIComponent(_authToken)}`;
+      const dlUrl = `/uploads/${encodeURIComponent(m.name)}`;
       const card  = document.createElement('div');
       card.className = 'msg-file';
       card.innerHTML = `
@@ -487,10 +517,14 @@
       catch (_) { ctx = new AudioContext(); }
       if (ctx.state === 'suspended') await ctx.resume();
 
-      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(
-        `${wsProto}://${location.host}/ws/phone-audio?token=${encodeURIComponent(_authToken)}`
-      );
+      let micTicket;
+      try {
+        micTicket = await _wsTicket();
+      } catch {
+        sys('Session expired — refresh to reconnect.');
+        return;
+      }
+      const ws = new WebSocket(_wsUrl('/ws/phone-audio', micTicket));
       ws.binaryType = 'arraybuffer';
 
       ws.onopen = async () => {

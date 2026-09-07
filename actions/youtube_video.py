@@ -9,15 +9,10 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote_plus
 
-try:
-    import pyautogui
-    _PYAUTOGUI = True
-# Not ImportError — pyautogui connects to an X display at import time and raises
-# DisplayConnectionError when there is none. See actions/computer_control.py.
-except Exception as _e:
-    print(f"[youtube_video] pyautogui unavailable ({type(_e).__name__}) — "
-          "playback key control disabled.")
-    _PYAUTOGUI = False
+# pyautogui était importé ici et jamais utilisé : la garde protégeait un import
+# qui ne servait à rien, au prix d'une connexion X ouverte à chaque démarrage.
+# Si ce module doit un jour piloter la lecture au clavier, c'est core/desktop
+# qui le fera (R-09).
 
 try:
     import numpy as np

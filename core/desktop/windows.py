@@ -70,8 +70,9 @@ def screenshot() -> tuple[bytes, str]:
     try:
         import mss
         import mss.tools
-    except ImportError as e:
-        raise UnsupportedOnThisPlatform("pip install mss") from e
+    # cf. core/desktop/linux.py — mss ne se contente pas d'ImportError.
+    except Exception as e:
+        raise UnsupportedOnThisPlatform(f"pip install mss ({type(e).__name__})") from e
 
     with mss.mss() as sct:
         shot = sct.grab(sct.monitors[0])
@@ -258,9 +259,9 @@ def set_wallpaper(path: str | Path) -> None:
 # ── input injection ──────────────────────────────────────────────────────────
 
 def input_capability() -> Capability:
-    """Windows has no Wayland problem: SendInput reaches every window."""
-    try:
-        import pyautogui  # noqa: F401
-        return Capability("input", True, "pyautogui/SendInput")
-    except Exception:
-        return Capability("input", False, "none", "pip install pyautogui")
+    """Windows has no Wayland problem: SendInput reaches every window.
+
+    Delegated to core/desktop/input.py, which owns this surface everywhere.
+    """
+    from . import input as _input
+    return _input.capability_for("windows")

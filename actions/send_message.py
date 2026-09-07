@@ -4,23 +4,12 @@ import sys
 import time
 from pathlib import Path
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE    = 0.06
-    _PYAUTOGUI = True
-# Not ImportError — pyautogui connects to an X display at import time and raises
-# DisplayConnectionError when there is none. See actions/computer_control.py.
-except Exception as _e:
-    print(f"[send_message] pyautogui unavailable ({type(_e).__name__}) — "
-          "message sending disabled.")
-    _PYAUTOGUI = False
+# R-09 : ce module tape un message dans une fenêtre de messagerie. C'est
+# exactement le cas où une frappe perdue est invisible — le texte n'arrive nulle
+# part et rien ne le signale. La façade choisit un mécanisme qui atteint
+# réellement la fenêtre, et refuse bruyamment quand il n'y en a pas.
+from core import desktop
 
-try:
-    import pyperclip
-    _PYPERCLIP = True
-except ImportError:
-    _PYPERCLIP = False
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -37,47 +26,57 @@ def _get_os() -> str:
         return "windows"
 
 
-def _require_pyautogui():
-    if not _PYAUTOGUI:
-        raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
+def _require_input():
+    """Refuse before typing, with the reason and the fix — see
+    actions/computer_control.py for why the message comes from the facade."""
+    cap = desktop.capabilities()["input"]
+    if not cap.available:
+        raise RuntimeError(f"Cannot type the message: {cap.detail}")
+
+
+def _modifier() -> str:
+    """The chord modifier for this OS.
+
+    "super" resolves to Command on macOS and to the Windows/Super key elsewhere,
+    so callers stop branching on the OS to pick between "command" and "ctrl" —
+    except that on macOS the *editing* chords really are Command and on the
+    others they really are Ctrl, which is a different key, not a different name.
+    """
+    return "super" if _get_os() == "mac" else "ctrl"
 
 
 def _paste_text(text: str) -> None:
-    _require_pyautogui()
-
-    os_name = _get_os()
-    paste_hotkey = ("command", "v") if os_name == "mac" else ("ctrl", "v")
-
-    if _PYPERCLIP:
-        pyperclip.copy(text)
+    _require_input()
+    try:
+        desktop.clipboard_set(text)
         time.sleep(0.15)
-        pyautogui.hotkey(*paste_hotkey)
+        desktop.hotkey(_modifier(), "v")
         time.sleep(0.1)
-    else:
-        pyautogui.write(text, interval=0.03)
+    except Exception:
+        # No clipboard on this machine — type it. Slower, and the only option
+        # that still delivers the message.
+        desktop.type_text(text, interval=0.03)
 
 
 def _clear_and_paste(text: str) -> None:
-    _require_pyautogui()
-    os_name = _get_os()
-    select_all = ("command", "a") if os_name == "mac" else ("ctrl", "a")
-    pyautogui.hotkey(*select_all)
+    _require_input()
+    desktop.hotkey(_modifier(), "a")
     time.sleep(0.1)
-    pyautogui.press("delete")
+    desktop.key("delete")
     time.sleep(0.1)
     _paste_text(text)
 
 def _open_app(app_name: str) -> bool:
-    _require_pyautogui()
+    _require_input()
     os_name = _get_os()
 
     try:
         if os_name == "windows":
-            pyautogui.press("win")
+            desktop.key("win")
             time.sleep(0.5)
             _paste_text(app_name)
             time.sleep(0.6)
-            pyautogui.press("enter")
+            desktop.key("enter")
             time.sleep(2.5)
             return True
 
@@ -129,11 +128,8 @@ def _open_browser_url(url: str) -> bool:
         return False
 
 def _search_in_app(query: str) -> None:
-    _require_pyautogui()
-    os_name = _get_os()
-    search_hotkey = ("command", "f") if os_name == "mac" else ("ctrl", "f")
-
-    pyautogui.hotkey(*search_hotkey)
+    _require_input()
+    desktop.hotkey(_modifier(), "f")
     time.sleep(0.5)
     _clear_and_paste(query)
     time.sleep(1.0)
@@ -144,12 +140,12 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
 
     time.sleep(1.0)
     _search_in_app(receiver)
-    pyautogui.press("enter")
+    desktop.key("enter")
     time.sleep(0.8)
 
     _paste_text(message)
     time.sleep(0.2)
-    pyautogui.press("enter")
+    desktop.key("enter")
     time.sleep(0.3)
     return f"Message sent to {receiver} via {app_name}."
 
@@ -168,7 +164,7 @@ def _send_discord(receiver: str, message: str) -> str:
 
 
 def _send_instagram(receiver: str, message: str) -> str:
-    _require_pyautogui()
+    _require_input()
 
     if not _open_browser_url("https://www.instagram.com/direct/new/"):
         return "Could not open Instagram in browser."
@@ -176,27 +172,27 @@ def _send_instagram(receiver: str, message: str) -> str:
     _paste_text(receiver)
     time.sleep(1.5)
 
-    pyautogui.press("down")
+    desktop.key("down")
     time.sleep(0.3)
-    pyautogui.press("enter")   
+    desktop.key("enter")   
     time.sleep(0.4)
 
     for _ in range(4):
-        pyautogui.press("tab")
+        desktop.key("tab")
         time.sleep(0.15)
-    pyautogui.press("enter")
+    desktop.key("enter")
     time.sleep(2.0)
 
     _paste_text(message)
     time.sleep(0.2)
-    pyautogui.press("enter")
+    desktop.key("enter")
     time.sleep(0.3)
 
     return f"Message sent to {receiver} via Instagram."
 
 
 def _send_messenger(receiver: str, message: str) -> str:
-    _require_pyautogui()
+    _require_input()
 
     if not _open_browser_url("https://www.messenger.com/"):
         return "Could not open Messenger in browser."
@@ -204,14 +200,14 @@ def _send_messenger(receiver: str, message: str) -> str:
 
     _search_in_app(receiver)
     time.sleep(0.5)
-    pyautogui.press("down")
+    desktop.key("down")
     time.sleep(0.3)
-    pyautogui.press("enter")
+    desktop.key("enter")
     time.sleep(1.0)
 
     _paste_text(message)
     time.sleep(0.2)
-    pyautogui.press("enter")
+    desktop.key("enter")
     time.sleep(0.3)
 
     return f"Message sent to {receiver} via Messenger."
@@ -249,8 +245,9 @@ def send_message(
         return "Please specify a recipient."
     if not message_text:
         return "Please specify the message content."
-    if not _PYAUTOGUI:
-        return "PyAutoGUI is not installed — cannot control the desktop."
+    cap = desktop.capabilities()["input"]
+    if not cap.available:
+        return f"Cannot send the message — no way to type on this machine: {cap.detail}"
 
     preview = message_text[:50] + ("…" if len(message_text) > 50 else "")
     print(f"[SendMessage] 📨 {platform} → {receiver}: {preview}")

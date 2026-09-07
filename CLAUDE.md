@@ -116,6 +116,9 @@ modèle. Ne pas rouvrir la faille du paramètre `confirmed=yes`.
 
 **R-05** · Réversible → exécuter tout de suite + `push_undo`. Irréversible seulement → confirmer.
 Le critère est la réversibilité, pas la gravité du mot.
+Le verdict vit dans `core/tool_policy.py`, **une seule table**, consultée par `_execute_tool`
+avant tout appel. Elle juge sur les *arguments* : `file_controller` qui lit et
+`file_controller` qui supprime portent le même nom d'outil.
 
 **R-06** · Une capacité se mesure, elle ne se déclare pas (cf. `core/audio_devices.py`).
 
@@ -126,6 +129,9 @@ Le critère est la réversibilité, pas la gravité du mot.
 
 **R-09** · Sous Wayland : **portail, jamais X11**. Passer par `core/desktop`, jamais
 appeler `mss` / `pyautogui` / `pygetwindow` directement depuis une action.
+Appliquée par `tests/test_input_facade.py` — liste d'exemptions **vide**. La règle est
+restée décorative jusqu'à la phase 08 parce que la façade n'exposait rien pour le clavier :
+9 modules, 140 appels `pyautogui` directs, faute d'ailleurs où aller. Voir `core/desktop/input.py`.
 
 
 **R-10** · Pas de PyGObject dans le venv. D-Bus via `jeepney` / `dbus-fast` (Python pur).
@@ -154,7 +160,7 @@ pas toujours ; le prix d'une erreur doit être une contrariété, pas un dossier
 
 ```bash
 .venv/bin/python main.py            # lancer
-.venv/bin/python -m pytest          # 255 tests, sans micro/écran/clé API/réseau
+.venv/bin/python -m pytest          # 480 tests, sans micro/écran/clé API/réseau
 .venv/bin/python -m core.telemetry  # ce que les modèles ont réellement coûté
 .venv/bin/python -c "from core import desktop; print(desktop.report())"  # capacités système
 .venv/bin/python -c "from core import local;   print(local.report())"    # pile hors-ligne
@@ -194,10 +200,73 @@ Un « non » **doit** dire ce qui le corrigerait.
 | Presse-papiers | pyperclip / wl-clipboard | pyperclip | pyperclip / pbcopy |
 | Notification | notify-send | win10toast | osascript |
 | Fond d'écran | portail Wallpaper | SystemParametersInfoW | osascript |
-| Entrées | ✗ ydotool/wtype absents | SendInput | Quartz (permission) |
+| Entrées | portail RemoteDesktop | SendInput | Quartz (permission) |
 
 `mss` sous Wayland **ne plante pas** : il renvoie un rectangle noir. C'est pour ça que la
 détection de session passe avant le choix du mécanisme.
+
+### `core/desktop/input.py` — clavier et souris (phase 08)
+
+Le chaînon qui manquait à R-09. `input_capability()` décrivait une capacité que la façade
+n'offrait pas ; les actions n'avaient nulle part où aller, d'où 140 appels `pyautogui`
+directs dans 9 modules. Ils sont tous partis.
+
+```python
+desktop.type_text("bonjour")          desktop.key("enter")
+desktop.hotkey("ctrl", "shift", "escape")
+desktop.click(); desktop.move_by(dx, dy); desktop.scroll(3)
+desktop.screen_size()                 desktop.input_mechanism()  # "SendInput"
+```
+
+- **Un seul vocabulaire.** `win`, `super`, `cmd`, `command` sont la même touche ; un module
+  d'action ne branche plus sur l'OS pour choisir le mot. Sur macOS `super` devient Command,
+  parce que là-bas ce n'est pas une orthographe, c'est une autre touche.
+- **Keysyms X11, pas keycodes.** Un keycode est une position physique : synthétiser `a` par
+  keycode tape `q` sur un clavier AZERTY. Le keysym est la lettre.
+- **`pyautogui.hotkey("ctrl", "nosuchkey")` ne lève rien** — `keyDown` sort silencieusement
+  sur un nom inconnu, Ctrl descend, remonte, et l'appel annonce un succès. La façade valide
+  contre `KEYBOARD_KEYS` avant d'appuyer (R-12).
+- **Wayland : `libei` non, portail oui.** libei est installé (1.5.0) mais sa liaison Python
+  passe par l'introspection GObject, que R-10 exclut. Le portail RemoteDesktop atteint le
+  même chemin dans mutter — qui l'implémente *au-dessus* de libei — en D-Bus pur via jeepney.
+- **Ce que Wayland ne fait toujours pas** : le pointage **absolu**. `NotifyPointerMotionAbsolute`
+  exige un identifiant de flux PipeWire, donc une session ScreenCast liée — une seconde
+  autorisation de *partage d'écran* pour bouger une souris. Non câblé, et `move_to()` le dit
+  au lieu de déplacer le pointeur quelque part de plausible. Le clavier, les boutons, le
+  mouvement relatif et le défilement fonctionnent : 117 des 140 appels repris.
+- **La session coûte une boîte de dialogue.** Créée une fois, gardée sur sa propre connexion
+  D-Bus, `persist_mode=2` et jeton de restauration sous `~/.config/alexio` pour que le
+  deuxième lancement soit muet. Une session morte est jetée, pas contournée par XTEST.
+
+### `core/tool_policy.py` — qui demande, qui agit (phase 09)
+
+Trois pièces correctes qui ne se parlaient pas : `core/confirm.py` émettait un jeton
+infalsifiable utilisé **à un seul endroit** ; `ToolSpec.irreversible` existait et n'était
+peuplé que par un test ; et `_execute_tool` ne consultait ni l'un ni l'autre. Résultat :
+`shutdown_jarvis` appelait `os._exit(0)` sur la parole du modèle, et `dev_agent` écrivait
+du code généré, `pip install`ait les paquets que les traces de ce code nommaient, puis
+l'exécutait.
+
+```bash
+.venv/bin/python -c "from core import tool_policy; import main; print(tool_policy.describe(main.TOOL_DECLARATIONS))"
+```
+
+Trois verdicts : `RUN` (réversible — agir maintenant, `push_undo`), `CONFIRM` (irréversible
+— `core/confirm.py`), `SELF` (le module a sa propre porte ; deux bannières pour une demande,
+l'utilisateur répond à la première et rien ne se passe). `SELF` est une affirmation sur le
+code d'un autre module, donc le test la vérifie **contre sa source**.
+
+`_sync_handlers` remplace 18 branches `elif` par une table de callables. Ce n'est pas une
+question de lignes : un `await` en ligne ne peut pas être remis à `core/confirm.py` pour
+être exécuté plus tard, un callable si.
+
+Quatre outils demandent : `shutdown_jarvis`, `dev_agent`, `code_helper` en `run`/`build`,
+`game_updater` avec `shutdown_when_done`. `code_helper` en `auto` repasse par la porte
+**après** avoir résolu l'intention — sinon « lance ça » formulé en description était le seul
+contournement de la règle.
+
+`dev_agent` ne pose plus de paquets dans le venv d'Alexio : `_project_python()` crée un venv
+par projet. Impossible → il **refuse** d'installer au lieu de retomber sur `sys.executable`.
 
 ### `core/local` — hors-ligne (phase 05)
 
@@ -210,6 +279,40 @@ détection de session passe avant le choix du mécanisme.
 - **`speech`** — Parakeet TDT v3 (STT) et Piper (TTS), chargés paresseusement.
   Rien n'est installé par défaut : `pip install -r requirements-local.txt`.
   *Pas* faster-whisper (~3× temps réel contre ~30×), *pas* Kokoro (3,6 s et 2 Go de pic).
+
+### `dashboard/` — la seule surface exposée au réseau (phase 06)
+
+Tout le reste d'Alexio échoue à l'abri parce qu'il est injoignable. Le dashboard écoute sur
+`0.0.0.0` : ses bugs sont atteignables par n'importe qui sur le réseau.
+
+- **`dashboard/auth.py`** — `CredentialStore` : tout ce qui est distribué et sa durée de vie.
+  Aucune dépendance hors bibliothèque standard, et l'horloge est injectable — une expiration
+  qu'on ne peut vérifier qu'en attendant trente jours est une expiration que personne ne
+  vérifie. `tests/test_dashboard_security.py` la déplace.
+- La clé de 6 caractères **apparie**, elle ne chiffre pas. L'appariement rend 256 bits
+  aléatoires ; plus rien n'est dérivé d'une chaîne saisie.
+- Durées : session 12 h glissantes / 7 j absolus · appareil 30 j absolus / 7 j d'inactivité,
+  8 maximum, stockés hachés · ticket WebSocket 30 s à usage unique.
+- Étranglement : 5 échecs par adresse et par minute ; à 20 échecs globaux en 5 minutes,
+  **toutes les clés en attente sont brûlées**. Une limite par adresse ne protège pas 30 bits.
+- CryptoJS est épinglé par son empreinte SHA-512 (SRI cdnjs, vérifiée le 2026-09-07) et
+  téléchargé depuis `serve()`, jamais à l'import.
+
+**R-16** · **Cookie = navigation. En-tête `Authorization` = API.** Jamais l'inverse, jamais
+les deux. Un site tiers peut faire envoyer un cookie par le navigateur ; il ne peut pas lui
+faire poser un en-tête. Séparer les deux ne *défend* pas contre le CSRF, il le rend
+impossible — et c'est ce qui autorise le cookie qui garde `/` côté serveur.
+
+**R-18** · **Le dispatch consulte la porte.** Aucun outil ne s'exécute sans que
+`core/tool_policy.classify()` ait rendu un verdict, et tout outil livré a une règle
+explicite — pas le défaut. Appliquée par `tests/test_tool_policy.py`.
+Le défaut pour un outil *inconnu* est `RUN`, délibérément : une porte qui demande pour tout
+apprend à l'utilisateur à cliquer oui sans lire, ce qui ressemble à un consentement sans en
+être un. La liste `CONFIRM` est plafonnée à 4 par un test.
+
+**R-17** · **Rien ne demande l'élévation au démarrage.** Ni UAC, ni `pkexec`, ni `sudo`, ni
+`osascript … with administrator privileges`. Un programme qui réclame les droits admin par
+effet de bord apprend à l'utilisateur à dire oui. Un « non » imprime la commande exacte.
 
 ---
 
@@ -228,20 +331,61 @@ reconnexion (l'ancien `async with` implicite avait disparu du refactor).
 
 Corrigé en phase 03 : `registry.load()` qui écrasait les mesures au lieu de les enrichir.
 
+Corrigé en phase 06 : la clé AES dérivée de la clé de 6 caractères (SHA-256 + sel fixe dans
+la source, ~2^29,7 candidats), les jetons d'appareil éternels, la page `/` gardée en
+JavaScript, les quatre chemins d'élévation du pare-feu, l'absence de compteur d'échecs, et
+le bundle CryptoJS téléchargé à l'import sans contrôle d'intégrité.
+
+Corrigé en phase 08 : `from playwright.async_api import …` **sans garde** dans
+`actions/browser_control.py`, importé au niveau module par `main.py` — sur une installation
+neuve, Alexio ne démarrait pas du tout. Même classe que les cinq gardes `pyautogui` de la
+phase 00, ratée parce que l'audit cherchait des gardes *trop étroites*, pas des imports
+*sans garde*. Avec elle, dix `except ImportError` là où le paquet lève autre chose
+(pyperclip, cv2, mss, win32com), les 1 259 lignes mortes de `core/llm_client.py`,
+`core/tts.py`, `core/stt.py`, `core/installer.py`, et les quatre `asyncio.get_event_loop()`
+dans des coroutines. `tests/test_optional_dependencies.py` retire chaque paquet optionnel un
+par un — puis tous d'un coup — et importe l'application entière.
+
 Reste :
 
-- `core/llm_client.py` est remplacé par `core/ai/local.py` — **à supprimer**.
-  `core/stt.py`, `core/tts.py`, `core/installer.py` attendent Parakeet/Piper (phase 05).
-- `actions/screen_processor.py` : `_capture_screen` utilise encore `mss` (phase 04).
 - Le classifieur d'intention (classe « Réflexe », < 200 ms sans modèle) reste à faire —
   il vit avec le mot de réveil en phase 05.
-- Dashboard : clé 6 caractères en SHA-256 + sel fixe, jetons d'appareil sans expiration,
-  page `/` authentifiée côté client seulement, ouverture automatique du pare-feu avec élévation.
-- `config/certs/jarvis.key` est dans l'historique Git malgré le `.gitignore`.
-- 255 tests, mais aucune CI ne les lance encore.
-- **Injection clavier/souris indisponible sous Wayland** : ni `ydotool` ni `wtype` installés,
-  et `pyautogui` ne touche que les fenêtres XWayland. `libei` 1.5.0 et le portail
-  RemoteDesktop v2 sont présents — le câblage reste à faire.
+- `computer_settings.volume_get()` renvoie `None` sur cette machine Windows alors que
+  `desktop.capabilities()` annonce `yes volume pycaw` : `AudioUtilities.GetSpeakers()` rend
+  un `AudioDevice` sans `.Activate` dans le pycaw installé. Une capacité qui dit oui et
+  répond None, c'est exactement ce que R-06 interdit — à corriger des deux côtés.
+- Le pointage **absolu** sous Wayland (`move_to`, `click(x, y)`) demande une session
+  ScreenCast liée pour l'identifiant de flux PipeWire. Refusé explicitement, pas contourné.
+- **R-03 n'est pas tenue par trois modules.** `file_processor`, `flight_finder` et
+  `game_updater` ont `(parameters, player, speak)` au lieu de
+  `(parameters, response, player, session_memory, speak)`. C'est pour ça que
+  `_sync_handlers` passe des mots-clés différents selon l'outil au lieu d'un appel uniforme.
+  `tests/test_actions.py` vérifie que le dispatch appelle chacun avec des arguments qu'il
+  accepte réellement — mais uniformiser les trois signatures reste à faire.
+- `actions/` reste largement non couvert : `tests/test_actions.py` couvre le contrat d'appel,
+  `file_controller` en entier et les deux résolveurs purs. Les 16 autres modules n'ont que
+  le contrat.
+- `computer_settings._detect_action("increase the brightness")` rend `""`. La formulation
+  la plus naturelle en anglais ne résout pas ; « brighter » et « brightness up » oui.
+  Ce n'est pas un plantage — le vide déclenche `_suggest()`, un aller-retour qui nomme de
+  vrais candidats — mais c'est un aller-retour évitable. Il manque des alias.
+- `dev_agent` exécute toujours `plan["run_command"]`, une chaîne écrite par le modèle,
+  découpée sur les espaces. Confirmé et dans un venv de projet désormais, mais le contenu
+  reste choisi par le modèle.
+- `config/certs/jarvis.key` est toujours dans l'historique Git (commit `067f528`). La clé
+  locale n'est **plus** celle qui a fuité — `_ensure_certs()` en a régénéré une — donc rien
+  ne sert aujourd'hui une clé publiquement connue. Reste à purger l'historique :
+  `git filter-repo --invert-paths --path config/certs/jarvis.key` puis `push --force`.
+  Réécrit 50 SHA sur un dépôt public : c'est une décision, pas une correction.
+- 480 tests, mais aucune CI ne les lance encore.
+- `ui.py` : 4 158 lignes, 20 classes, un fichier — jamais touché par la refonte, et il
+  contient les seuls chemins de confirmation visuels. Toute extension de R-04 y passe.
+- `_base_dir()` est réécrit dans 15 fichiers (→ `core/paths.py`), et il reste 109
+  `except …: pass` (aucun `except:` nu, ce qui est déjà ça).
+- **Le chemin Wayland de `core/desktop/input.py` n'a jamais tourné sur un compositeur.**
+  Il est écrit contre la spécification du portail RemoteDesktop et couvert par une doublure
+  qui enregistre ce que le compositeur recevrait ; le chemin Windows/SendInput, lui, a été
+  exécuté pour de vrai. Première frappe sous GNOME 49 = première mesure.
 - Alexio n'a **jamais été exécuté sous Windows** depuis la refonte. La phase 07 vérifie que
   rien ne l'en empêche ; ce n'est pas la même chose que de l'avoir vu tourner.
 
@@ -252,3 +396,15 @@ Reste :
 - Commentaires denses expliquant le *pourquoi* d'une décision — c'est le style du dépôt, le garder.
 - Alignement vertical des dicts et assignations (style existant).
 - Messages d'erreur : ce qui a échoué + comment le corriger. Pas d'excuses.
+
+
+
+
+Trois choses trouvées, pas corrigées
+R-03 n'est pas tenue. file_processor, flight_finder et game_updater ont (parameters, player, speak) au lieu de la signature complète. C'est pour ça que _sync_handlers passe des mots-clés différents par outil. Le test vérifie que le dispatch est cohérent avec la réalité ; uniformiser les trois signatures reste à faire.
+
+_detect_action("increase the brightness") rend "". La formulation la plus naturelle en anglais ne résout pas ; « brighter » et « brightness up » oui. Pas un plantage — le vide déclenche _suggest() — mais un aller-retour évitable. Il manque des alias.
+
+dev_agent exécute toujours plan["run_command"], une chaîne écrite par le modèle, découpée sur les espaces. Confirmé et dans un venv de projet maintenant, mais le contenu reste choisi par le modèle.
+
+Reste de ton §3 : ui.py (4 158 lignes), core/paths.py pour les 15 _base_dir, et les 109 except: pass. Noté dans la dette — dis-moi si j'attaque.

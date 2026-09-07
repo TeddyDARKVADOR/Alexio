@@ -34,14 +34,18 @@ import platform
 import sys
 from pathlib import Path
 
+from . import input as _input
 from . import linux, macos, windows
 from .caps import Capability, UnsupportedOnThisPlatform
+from .input import KeyUnknown
 
 __all__ = [
     "screenshot", "brightness_get", "brightness_set", "volume_get", "volume_set",
     "trash", "clipboard_get", "clipboard_set", "notify", "set_wallpaper",
+    "type_text", "key", "hotkey", "click", "move_to", "move_by", "drag_to",
+    "scroll", "hscroll", "screen_size", "input_mechanism",
     "capabilities", "report", "backend", "backend_for", "Capability",
-    "UnsupportedOnThisPlatform",
+    "UnsupportedOnThisPlatform", "KeyUnknown",
 ]
 
 _BACKENDS = {"linux": linux, "windows": windows, "macos": macos}
@@ -119,6 +123,74 @@ def notify(title: str, body: str = "") -> None:
 
 def set_wallpaper(path: str | Path) -> None:
     backend().set_wallpaper(path)
+
+
+# ── input injection ──────────────────────────────────────────────────────────
+#
+# These do not go through backend(). The other surfaces genuinely have three
+# unrelated implementations; input has one implementation that picks among four
+# mechanisms, and two of the four (X11 and Windows) are the same code. Splitting
+# it across three files to preserve the pattern would triple it.
+#
+# This is the half of R-09 that was missing. An action that needs to press a key
+# has somewhere to go now, so "never call pyautogui from an action" is a rule
+# rather than a wish. tests/test_input_facade.py enforces it.
+
+def type_text(text: str, interval: float = 0.0) -> None:
+    """Type a string. Not a paste — the clipboard belongs to the user."""
+    _input.type_text(text, interval=interval)
+
+
+def key(name: str) -> None:
+    """Press and release one key, by a name that means the same everywhere:
+    `key("enter")`, `key("volumeup")`, `key("f11")`."""
+    _input.key(name)
+
+
+def hotkey(*names: str) -> None:
+    """A chord. `hotkey("ctrl", "shift", "escape")`.
+
+    "win", "cmd", "command" and "super" are the same key — the caller does not
+    branch on the OS to choose the word.
+    """
+    _input.hotkey(*names)
+
+
+def click(x: int | None = None, y: int | None = None,
+          button: str = "left", clicks: int = 1) -> None:
+    _input.click(x, y, button=button, clicks=clicks)
+
+
+def move_to(x: int, y: int, duration: float = 0.0) -> None:
+    _input.move_to(x, y, duration=duration)
+
+
+def move_by(dx: float, dy: float) -> None:
+    """Relative pointer motion — the only kind Wayland allows."""
+    _input.move_by(dx, dy)
+
+
+def drag_to(x: int, y: int, button: str = "left", duration: float = 0.0) -> None:
+    _input.drag_to(x, y, button=button, duration=duration)
+
+
+def scroll(clicks: int) -> None:
+    """Vertical. Positive is up."""
+    _input.scroll(clicks)
+
+
+def hscroll(clicks: int) -> None:
+    """Horizontal. Positive is right."""
+    _input.hscroll(clicks)
+
+
+def screen_size() -> tuple[int, int]:
+    return _input.screen_size()
+
+
+def input_mechanism(system: str | None = None) -> str:
+    """Which of the four input paths this machine uses. For logs and reports."""
+    return _input.mechanism(system)
 
 
 # ── capability report ────────────────────────────────────────────────────────

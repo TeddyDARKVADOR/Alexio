@@ -2754,7 +2754,11 @@ class MainWindow(QMainWindow):
             sc.IconLocation     = icon_loc
             sc.save()
             return
-        except ImportError:
+        # Pas seulement ImportError. Une installation pywin32 incomplète lève au
+        # chargement de la DLL, et Dispatch() lève com_error quand le service COM
+        # ne répond pas. Dans les deux cas l'option 2 ci-dessous marche encore —
+        # une garde étroite la rendait inatteignable.
+        except Exception:
             pass
 
         # ── Option 2: wscript.exe + VBScript (always available on Windows,
