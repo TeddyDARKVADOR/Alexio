@@ -9,7 +9,11 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.06
     _PYAUTOGUI = True
-except ImportError:
+# Not ImportError — pyautogui connects to an X display at import time and raises
+# DisplayConnectionError when there is none. See actions/computer_control.py.
+except Exception as _e:
+    print(f"[send_message] pyautogui unavailable ({type(_e).__name__}) — "
+          "message sending disabled.")
     _PYAUTOGUI = False
 
 try:

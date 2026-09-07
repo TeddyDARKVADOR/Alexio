@@ -83,6 +83,8 @@ from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
+from core                      import telemetry
+from core                      import ai
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -1634,14 +1636,13 @@ class JarvisLive:
             "Output ONLY the summary text, nothing else:\n\n" + convo
         )
         try:
-            from google import genai as _genai
-            client = _genai.Client(api_key=_get_api_key())
-            resp   = await asyncio.to_thread(
-                client.models.generate_content,
-                model="gemini-flash-latest",
-                contents=prompt,
+            from core import ai
+            # Condensing forty turns into two sentences is a cheap job, and it
+            # runs at shutdown while the user is already saying goodbye.
+            resp = await asyncio.to_thread(
+                lambda: ai.generate(prompt, tier=ai.Tier.FAST, task="session_summary")
             )
-            summary = (resp.text or "").strip()
+            summary = resp.stripped
             if summary:
                 save_session_summary(summary, lang)
         except Exception as e:
@@ -1813,6 +1814,8 @@ class JarvisLive:
             log  = self.ui.write_log,
         )
         set_trim_notifier(self.ui.write_log)
+        telemetry.set_notifier(self.ui.write_log)
+        ai.set_logger(self.ui.write_log)
 
         # Tell the device picker the exact rates the streams open at, from the
         # constants that actually open them — so it can never list a device that
@@ -1973,9 +1976,12 @@ class JarvisLive:
                 if is_net_err:
                     _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                     self._conn_backoff = _conn_backoff
+                    # Every other line in this log is English; this one was Turkish,
+                    # so on any non-Turkish machine it was the single sentence the
+                    # user could not read — and it appears exactly when something
+                    # is wrong. Kept in the log's own language, like the rest.
                     self.ui.write_log(
-                        f"NET: Bağlantı kurulamadı — {_conn_backoff}s sonra tekrar deneniyor. "
-                        "(VPN gerekiyor olabilir)"
+                        f"NET: Connection failed — retrying in {_conn_backoff}s."
                     )
                 else:
                     self._conn_backoff = 3

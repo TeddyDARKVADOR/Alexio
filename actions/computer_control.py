@@ -20,7 +20,14 @@ try:
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE    = 0.05
     _PYAUTOGUI = True
-except ImportError:
+# Not ImportError. On Linux, pyautogui opens an X display at import time and
+# raises Xlib.error.DisplayConnectionError when there isn't one — over SSH, on a
+# TTY, in a systemd unit, in CI. That is not an ImportError, so the narrow guard
+# let it escape and killed the import of this module, and with it all of main.py:
+# the assistant could not start at all rather than losing one optional feature.
+except Exception as _e:
+    print(f"[computer_control] pyautogui unavailable ({type(_e).__name__}) — "
+          "keyboard and mouse control disabled.")
     _PYAUTOGUI = False
 
 try:
@@ -311,14 +318,8 @@ def _focus_window(title: str) -> str:
     return f"focus_window: unknown OS '{os_name}'"
 
 def _screen_find(description: str) -> tuple[int, int] | None:
-    api_key = _get_api_key()
-    if not api_key:
-        print("[ComputerControl] ⚠️ No API key for screen_find")
-        return None
-
     try:
-        from google import genai
-        from google.genai import types as gtypes
+        from core import ai
 
         _require_pyautogui()
         w, h  = pyautogui.size()
@@ -327,7 +328,6 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         img.save(buf, format="PNG")
         image_bytes = buf.getvalue()
 
-        client = genai.Client(api_key=api_key)
         prompt = (
             f"This is a screenshot of a {w}×{h} pixel screen. "
             f"Locate the UI element described as: '{description}'. "
@@ -335,15 +335,14 @@ def _screen_find(description: str) -> tuple[int, int] | None:
             f"If the element is not visible, reply: NOT_FOUND"
         )
 
-        response = client.models.generate_content(
-            model="gemini-flash-lite-latest",
-            contents=[
-                gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-                prompt,
-            ],
-        )
-
-        text = (response.text or "").strip()
+        # Locating a box on a screenshot is exactly what the fast tier is for:
+        # the answer is eight characters and the user is waiting for a click.
+        text = ai.generate(
+            prompt,
+            media=[ai.Media(data=image_bytes, mime_type="image/png")],
+            tier=ai.Tier.FAST,
+            task="screen_find",
+        ).stripped
         if "NOT_FOUND" in text.upper():
             return None
 

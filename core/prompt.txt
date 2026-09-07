@@ -25,11 +25,11 @@ Do not mix two languages in one reply.
 TOOL ROUTING:
 
 computer_settings: ALL single OS actions (volume, brightness, wifi, close, shortcuts, power).
-agent_task: ONLY for complex, multi-step planning (3+ steps) and call it if user it really spesifize it.
+dev_agent: ONLY for building a complete multi-file project from scratch (plan, write files, install deps, run and fix). This is the multi-step planner; there is no other.
 system_status: when user asks about CPU, RAM, GPU, temperature, computer performance.
 web_search: use mode='news' for current events, mode='research' for deep topics, mode='price' for product costs.
 Tool parameters are always extracted in English; see the LANGUAGE section above for what you SPEAK.
-Do not call agent_task while you can accomplish it with a tool
+Do not call dev_agent when a single tool can accomplish the task.
 wants to open a video = youtube. Always know the context for better User Experience
 If user wants to do a taks more than 1, attain them and do them one by one(f.e: User: "open a relax rainy video and make it full screen" that means that you should open a video first, and then always wait 3-4 seconds to load the video and then press 'F' button to make it full screen) always know the context and attain them(Video opened in youtube, full screen means 'F' button).
 LANGUAGE DETECTION:

@@ -25,19 +25,43 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
-def _get_api_key() -> str:
-    config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+def _to_request(contents) -> tuple[str, list]:
+    """Split this module's `contents` argument into (prompt, media).
+
+    Eleven call sites here pass one of three shapes: a bare string, a
+    [prompt, PIL.Image] pair, or a [prompt, {"mime_type", "data"}] pair for
+    audio. Normalising once, here, is what let the eleven of them migrate to the
+    gateway without any of them changing.
+    """
+    from core import ai
+
+    if isinstance(contents, str):
+        return contents, []
+
+    prompt_parts: list[str] = []
+    media: list = []
+    for part in contents:
+        if isinstance(part, str):
+            prompt_parts.append(part)
+        elif isinstance(part, dict) and "data" in part:
+            media.append(ai.Media(data=part["data"],
+                                  mime_type=part.get("mime_type", "application/octet-stream")))
+        elif hasattr(part, "save"):                 # a PIL Image
+            media.append(ai.Media.from_pil(part))
+        elif isinstance(part, (bytes, bytearray)):
+            media.append(ai.Media(data=bytes(part), mime_type="image/png"))
+    return "\n".join(prompt_parts), media
 
 
-def _gemini_client():
-    from google import genai
-    _c = genai.Client(api_key=_get_api_key())
+def _gemini_client(task: str = "file_processor"):
+    """Kept as a shim so the eleven `model.generate_content(...)` call sites in
+    this file stay untouched; everything behind it now goes through core/ai."""
+    from core import ai
 
     class _W:
         def generate_content(self, contents):
-            return _c.models.generate_content(model="gemini-flash-latest", contents=contents)
+            prompt, media = _to_request(contents)
+            return ai.generate(prompt, media=media or None, task=task)
 
     return _W()
 

@@ -62,17 +62,15 @@ def _parse_date(raw: str) -> str:
             return val.strftime("%Y-%m-%d")
 
     try:
-        from google import genai as _genai
-        _client  = _genai.Client(api_key=_get_api_key())
-        response = _client.models.generate_content(
-            model="gemini-flash-lite-latest",
-            contents=(
-                f"Today is {today.strftime('%Y-%m-%d')}. "
-                f"Convert this date expression to YYYY-MM-DD: '{raw}'. "
-                f"Return ONLY the date string, nothing else."
-            )
-        )
-        result = response.text.strip()
+        from core import ai
+        # Turning "next friday" into a date is the cheapest job in the system.
+        result = ai.generate(
+            f"Today is {today.strftime('%Y-%m-%d')}. "
+            f"Convert this date expression to YYYY-MM-DD: '{raw}'. "
+            f"Return ONLY the date string, nothing else.",
+            tier=ai.Tier.FAST,
+            task="parse_date",
+        ).stripped
         if re.match(r"\d{4}-\d{2}-\d{2}", result):
             return result
     except Exception as e:
@@ -154,10 +152,8 @@ def _parse_flights_with_gemini(
     destination: str,
     date:        str,
 ) -> list[dict]:
-    from google import genai as _genai
-    from google.genai import types
+    from core import ai
 
-    _client = _genai.Client(api_key=_get_api_key())
     prompt  = (
         f"Extract flight options from {origin} to {destination} on {date} "
         f"from this Google Flights page text:\n\n{raw_text[:12000]}\n\n"
@@ -168,16 +164,14 @@ def _parse_flights_with_gemini(
     )
 
     try:
-        response = _client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "You are a flight data extraction expert. "
-                    "Extract flight information from raw webpage text. "
-                    "Return ONLY valid JSON — no markdown, no explanation."
-                )
+        response = ai.generate(
+            prompt,
+            system=(
+                "You are a flight data extraction expert. "
+                "Extract flight information from raw webpage text. "
+                "Return ONLY valid JSON — no markdown, no explanation."
             ),
+            task="extract_flights",
         )
         text     = re.sub(r"```(?:json)?", "", response.text).strip().rstrip("`").strip()
         flights  = json.loads(text)

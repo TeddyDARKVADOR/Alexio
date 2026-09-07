@@ -21,10 +21,18 @@ def _gemini_available() -> bool:
 
 
 def _note_gemini_error(exc: Exception) -> None:
-    """Trip the breaker when the error is a quota / rate-limit rejection."""
+    """Trip the breaker when the error is a quota / rate-limit rejection.
+
+    The gateway now classifies this for us and raises ai.QuotaExceeded, so the
+    string match below is only a safety net for errors that reach here from
+    somewhere else. It stays because a breaker that fails to trip costs a dead
+    round trip on every search for fifteen minutes.
+    """
     global _quota_blocked_until
+    from core import ai
+
     msg = str(exc)
-    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+    if isinstance(exc, ai.QuotaExceeded) or "429" in msg or "RESOURCE_EXHAUSTED" in msg:
         with _quota_lock:
             already = time.monotonic() < _quota_blocked_until
             _quota_blocked_until = time.monotonic() + _QUOTA_COOLDOWN_SEC
@@ -78,32 +86,27 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _gemini_search(query: str) -> str:
+def _grounded_search(query: str) -> str:
+    """A web-grounded answer, or an exception. Never an empty string.
+
+    The gateway knows that a grounded reply arrives split across parts rather
+    than on `.text`, and raises rather than returning "" — reading only `.text`
+    is what used to turn a perfectly good grounded answer into "no results".
+    """
     if not _gemini_available():
-        raise _QuotaCooldown("Gemini grounding is in quota cooldown")
+        raise _QuotaCooldown("Web grounding is in quota cooldown")
 
-    from google import genai
+    from core import ai
 
-    client = genai.Client(api_key=_get_api_key())
     try:
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=query,
-            config={"tools": [{"google_search": {}}]},
-        )
+        return ai.generate(query, grounding=True, task="web_search").stripped
     except Exception as e:
         _note_gemini_error(e)
         raise
 
-    text = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            text += part.text
 
-    text = text.strip()
-    if not text:
-        raise ValueError("Gemini returned an empty response.")
-    return text
+# The old name, kept because three call sites below still use it.
+_gemini_search = _grounded_search
 
 
 def _get_ddgs():
@@ -205,19 +208,13 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
     Returns (headline_list, raw_text_for_display).
     """
     import re
-    from google import genai
+    from core import ai
 
-    client = genai.Client(api_key=_get_api_key())
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=f"Current world news: {n} headlines. Numbered list, titles only.",
-        config={"tools": [{"google_search": {}}]},
-    )
-
-    raw = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            raw += part.text
+    raw = ai.generate(
+        f"Current world news: {n} headlines. Numbered list, titles only.",
+        grounding=True,
+        task="headlines",
+    ).stripped
 
     headlines = []
     for line in raw.strip().split("\n"):

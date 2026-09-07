@@ -19,18 +19,20 @@ MAX_FIX_ATTEMPTS = 5
 MODEL_PLANNER    = "gemini-flash-latest"
 MODEL_WRITER     = "gemini-flash-latest"
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+def _get_model(model_name: str = MODEL_WRITER, task: str = "dev_agent"):
+    """Kept as a shim so this file's call sites stay untouched; everything behind
+    it now goes through core/ai.
 
-
-def _get_model(model_name: str):
-    from google import genai
-    _c = genai.Client(api_key=_get_api_key())
+    Building a whole project is the one job in Alexio that genuinely deserves the
+    deep tier — it plans, writes several files, then reads its own errors back.
+    """
+    from core import ai
 
     class _W:
         def generate_content(self, contents):
-            return _c.models.generate_content(model=model_name, contents=contents)
+            text = contents if isinstance(contents, str) else "\n".join(
+                c for c in contents if isinstance(c, str))
+            return ai.generate(text, tier=ai.Tier.DEEP, task=task, timeout=180)
 
     return _W()
 

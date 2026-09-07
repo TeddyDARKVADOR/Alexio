@@ -1,0 +1,9 @@
+# Alexio — outillage de développement.
+#
+#   pip install -r requirements-dev.txt
+#
+# La suite de tests tourne sans micro, sans écran et sans clé API : voir
+# tests/fake_ui.py et tests/conftest.py.
+
+pytest>=8.0
+pytest-asyncio>=0.24

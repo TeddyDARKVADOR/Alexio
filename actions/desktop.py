@@ -12,7 +12,11 @@ from datetime import datetime
 try:
     import pyautogui
     _PYAUTOGUI = True
-except ImportError:
+# Not ImportError — pyautogui connects to an X display at import time and raises
+# DisplayConnectionError when there is none. See actions/computer_control.py.
+except Exception as _e:
+    print(f"[desktop] pyautogui unavailable ({type(_e).__name__}) — "
+          "desktop key control disabled.")
     _PYAUTOGUI = False
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
@@ -103,8 +107,7 @@ def _execute_generated_code(code: str, player=None) -> str:
 
 def _ask_gemini_for_desktop_action(task: str) -> str:
 
-    from google import genai as _genai
-    _client = _genai.Client(api_key=_get_api_key())
+    from core import ai
 
     desktop = str(_get_desktop())
 
@@ -142,8 +145,7 @@ Output ONLY the Python code. No explanation, no markdown, no backticks.
 Task: {task}"""
 
     try:
-        response = _client.models.generate_content(model="gemini-flash-latest", contents=prompt)
-        code = response.text.strip()
+        code = ai.generate(prompt, task="desktop_action").stripped
         if code.startswith("```"):
             lines = code.split("\n")
             code  = "\n".join(lines[1:-1]).strip()

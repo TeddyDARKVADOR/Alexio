@@ -18,18 +18,27 @@ MAX_BUILD_ATTEMPTS = 3
 GEMINI_MODEL       = "gemini-flash-latest"
 
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+def _get_gemini(model: str = GEMINI_MODEL, task: str = "code_helper"):
+    """Kept as a shim so the six `model.generate_content(...)` call sites in this
+    file stay untouched; everything behind it now goes through core/ai.
 
+    The `model` argument survives only for the callers that still pass one. It
+    is read as an *intent* — a lite id means the job is cheap — because a call
+    site should say what the work deserves, not name a product that will be
+    renamed within the year.
+    """
+    from core import ai
 
-def _get_gemini(model: str = GEMINI_MODEL):
-    from google import genai
-    _c = genai.Client(api_key=_get_api_key())
+    tier = ai.Tier.FAST if "lite" in (model or "").lower() else ai.Tier.STANDARD
 
     class _W:
         def generate_content(self, contents):
-            return _c.models.generate_content(model=model, contents=contents)
+            if isinstance(contents, str):
+                return ai.generate(contents, tier=tier, task=task)
+            prompt = "\n".join(c for c in contents if isinstance(c, str))
+            media  = [ai.Media(data=c["data"], mime_type=c.get("mime_type", "image/png"))
+                      for c in contents if isinstance(c, dict) and "data" in c]
+            return ai.generate(prompt, media=media or None, tier=tier, task=task)
 
     return _W()
 
@@ -456,10 +465,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             print(f"[Code] ⚠️ Could not read file: {err}")
 
     try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=_get_api_key())
+        from core import ai
 
         image_bytes  = screenshot_path.read_bytes()
         image_base64 = _image_to_base64(screenshot_path)
@@ -482,17 +488,11 @@ Please:
 
 Be specific and actionable. If you see an error message, quote it exactly."""
 
-        contents = [
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+        analysis = ai.generate(
             analysis_prompt,
-        ]
-
-        response = client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=contents,
-        )
-
-        analysis = response.text.strip()
+            media=[ai.Media(data=image_bytes, mime_type="image/png")],
+            task="debug_screenshot",
+        ).stripped
         print(f"[Code] ✅ Screen analysis complete")
 
         try:

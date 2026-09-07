@@ -1,0 +1,13 @@
+# Alexio — extensions optionnelles de actions/file_processor.py.
+#
+# Chacune est importée derrière un try/except : sans elle le format concerné est
+# simplement refusé avec un message clair, le reste de l'assistant fonctionne.
+#
+#   pip install -r requirements-extra.txt
+
+python-docx           # .docx  — lecture et réécriture
+pypdf                 # .pdf   — extraction de texte (successeur de PyPDF2)
+pdfplumber            # .pdf   — extraction avec mise en page et tableaux
+pandas                # .csv / .xlsx — analyse, filtres, statistiques
+openpyxl              # .xlsx  — moteur de lecture pour pandas
+pydub                 # audio  — découpe et conversion (nécessite ffmpeg, présent)
