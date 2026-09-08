@@ -27,6 +27,7 @@ from .types import (
     ToolCall,
     ToolResult,
     VoiceConfig,
+    VoiceError,
     VoiceEvent,
 )
 
@@ -40,6 +41,84 @@ _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 def _clean(text: str) -> str:
     text = _CTRL_RE.sub("", text or "")
     return re.sub(r"[\x00-\x08\x0b-\x1f]", "", text).strip()
+
+
+def _audio_of(response) -> bytes | None:
+    """The PCM in one Live response, or None.
+
+    The SDK offers `response.data` for this, and it is the same concatenation —
+    but it also logs a warning the first time a model turn carries anything
+    besides audio: "there are non-data parts in the response: ['text',
+    'thought']". A native-audio model with thinking on sends those constantly.
+    The warning names nothing the user can act on and appears in the middle of a
+    conversation, so it reads like a fault when nothing is wrong.
+
+    Reading the parts here also makes the discard explicit rather than
+    incidental: the spoken words come back separately as `output_transcription`,
+    and the model's thoughts are not ours to show.
+    """
+    sc = getattr(response, "server_content", None)
+    turn = getattr(sc, "model_turn", None) if sc is not None else None
+    parts = getattr(turn, "parts", None) if turn is not None else None
+    if not parts:
+        return None
+    chunks = []
+    for part in parts:
+        inline = getattr(part, "inline_data", None)
+        data   = getattr(inline, "data", None) if inline is not None else None
+        if isinstance(data, bytes):
+            chunks.append(data)
+    return b"".join(chunks) if chunks else None
+
+
+def _as_session_closed(exc: BaseException) -> SessionClosed:
+    """Turn a transport failure into the plane's own error, with the close in it.
+
+    Nothing outside core/voice should have to know that this plane rides on a
+    websocket. Before this, a raw `websockets.exceptions.ConnectionClosedError`
+    travelled all the way into main.py's reconnect handler, which had no choice
+    but to match substrings on it — and so could not tell "the server ended the
+    session" from "we gave up waiting for a pong", two events with the same
+    symptom and different causes.
+
+    The close frame is read off the exception rather than parsed out of its
+    message: `sent` is the frame we sent, `rcvd` the one we received, and which
+    of the two is populated *is* the answer to who hung up.
+    """
+    code: int | None = None
+    reason = ""
+    by = ""
+
+    for e in _chain(exc):
+        rcvd = getattr(e, "rcvd", None)
+        sent = getattr(e, "sent", None)
+        # rcvd first: if both exist, the peer's close is the one that explains
+        # the disconnection — ours is the reply to it.
+        for frame, who in ((rcvd, "server"), (sent, "client")):
+            if frame is not None and getattr(frame, "code", None) is not None:
+                code, reason, by = frame.code, getattr(frame, "reason", "") or "", who
+                break
+        if code is not None:
+            break
+
+    if code is None and any(
+        "connectionclosed" in type(e).__name__.lower() for e in _chain(exc)
+    ):
+        code, by = 1006, "network"          # no frame either way
+
+    return SessionClosed(str(exc), code=code, reason=reason, by=by)
+
+
+def _chain(exc: BaseException, depth: int = 0):
+    """The exception and everything it was caused by, groups flattened."""
+    if exc is None or depth > 8:
+        return
+    yield exc
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            yield from _chain(sub, depth + 1)
+    yield from _chain(exc.__cause__, depth + 1)
+    yield from _chain(exc.__context__, depth + 1)
 
 
 def _looks_like_rejected_handle(err: str) -> bool:
@@ -143,15 +222,30 @@ class GeminiLiveSession:
             raise SessionClosed("No open Gemini Live session.")
         return self._session
 
+    # Every send can be the one that discovers the socket is gone — the
+    # microphone loop usually gets there first, simply because it sends most
+    # often. Each of them must fail as a SessionClosed carrying the close code,
+    # or the transport exception escapes the plane and main.py is back to
+    # guessing from strings.
     async def send_audio(self, pcm16: bytes) -> None:
-        await self._live().send_realtime_input(
-            media={"data": pcm16, "mime_type": "audio/pcm"}
-        )
+        try:
+            await self._live().send_realtime_input(
+                media={"data": pcm16, "mime_type": "audio/pcm"}
+            )
+        except VoiceError:
+            raise
+        except Exception as e:
+            raise _as_session_closed(e) from e
 
     async def send_text(self, text: str) -> None:
-        await self._live().send_client_content(
-            turns={"parts": [{"text": text}]}, turn_complete=True
-        )
+        try:
+            await self._live().send_client_content(
+                turns={"parts": [{"text": text}]}, turn_complete=True
+            )
+        except VoiceError:
+            raise
+        except Exception as e:
+            raise _as_session_closed(e) from e
 
     async def send_media(self, data: bytes, mime_type: str, text: str = "") -> None:
         import base64
@@ -163,17 +257,28 @@ class GeminiLiveSession:
         }]
         if text:
             parts.append({"text": text})
-        await self._live().send_client_content(turns={"parts": parts}, turn_complete=True)
+        try:
+            await self._live().send_client_content(turns={"parts": parts},
+                                                   turn_complete=True)
+        except VoiceError:
+            raise
+        except Exception as e:
+            raise _as_session_closed(e) from e
 
     async def send_tool_results(self, results: list[ToolResult]) -> None:
         from google.genai import types as gtypes
-        await self._live().send_tool_response(
-            function_responses=[
-                gtypes.FunctionResponse(id=r.id, name=r.name,
-                                        response={"result": r.result})
-                for r in results
-            ]
-        )
+        try:
+            await self._live().send_tool_response(
+                function_responses=[
+                    gtypes.FunctionResponse(id=r.id, name=r.name,
+                                            response={"result": r.result})
+                    for r in results
+                ]
+            )
+        except VoiceError:
+            raise
+        except Exception as e:
+            raise _as_session_closed(e) from e
 
     # ── receiving ────────────────────────────────────────────────────────
 
@@ -207,8 +312,8 @@ class GeminiLiveSession:
                     yield VoiceEvent(kind=EventKind.GO_AWAY,
                                      seconds_left=_seconds(left))
 
-                if response.data:
-                    data = response.data
+                data = _audio_of(response)
+                if data:
                     for i in range(0, len(data), slice_bytes):
                         yield VoiceEvent(kind=EventKind.AUDIO,
                                          audio=data[i:i + slice_bytes])
@@ -243,19 +348,41 @@ class GeminiLiveSession:
 
         except asyncio.CancelledError:
             raise
+        except VoiceError:
+            raise
         except Exception as e:
-            raise SessionClosed(str(e)) from e
+            raise _as_session_closed(e) from e
 
     @property
     def resume_handle(self) -> str | None:
         return self._handle
 
 
+_DURATION_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*s\s*$")
+
+
 def _seconds(value) -> float | None:
-    """`time_left` arrives as a protobuf Duration on some SDK versions and as a
-    plain number on others."""
+    """`time_left` arrives in three shapes, and the common one was unhandled.
+
+    Over the websocket transport the SDK types it `Optional[str]` and the
+    server sends a protobuf Duration — `"540s"`, where the trailing `s` is the
+    format, not a typo. The old code tried `total_seconds`, `seconds`, then
+    `float(value)`; a string has neither attribute and `float("540s")` raises,
+    so **every** go-away warning arrived with no number. The message said the
+    server was closing the connection and dropped the only part of it the user
+    could act on. The object and plain-number forms are kept because other SDK
+    versions and the Vertex transport still send those.
+    """
     if value is None:
         return None
+    if isinstance(value, str):
+        m = _DURATION_RE.match(value)
+        if m:
+            return float(m.group(1))
+        try:
+            return float(value)          # a bare "540", seen on some builds
+        except ValueError:
+            return None
     for attr in ("total_seconds", "seconds"):
         got = getattr(value, attr, None)
         if callable(got):

@@ -103,6 +103,37 @@ def _handle_token() -> str:
     return "alexio_" + secrets.token_hex(8)
 
 
+def with_handle_token(body: tuple, token: str, what: str = "") -> tuple:
+    """Return `body` with `handle_token` added to its trailing options dict.
+
+    Every portal method ends in `a{sv}`, and every one of them needs the token
+    that says where its Response will arrive. Two call sites build these bodies
+    — portal.call() here and _RemoteDesktop._request() in input.py, which cannot
+    reuse call() because it must stay on its own connection — so the injection
+    lives in one place. It was written twice, and it was wrong in both.
+
+    jeepney serialises an `a{sv}` element from a *plain dict* whose values are
+    (signature, value) variants. The dict itself is not a variant: wrapping it
+    as ("a{sv}", options) builds a body that looks plausible and dies inside the
+    serialiser with `Not suitable for array`, which is what took screenshots out
+    entirely and would have taken the first Wayland keystroke with it. Reading
+    the caller's options back as `body[-1][1]` failed the same way but silently
+    — `isinstance({}, tuple)` is False, so every option passed in was dropped.
+    """
+    if not body or not isinstance(body[-1], dict):
+        got = type(body[-1]).__name__ if body else "nothing"
+        raise PortalError(
+            f"{what or 'This portal call'} was built wrong: the last body "
+            f"element must be the options dict (portal methods all end in "
+            f"a{{sv}}), got {got}."
+        )
+    out = list(body)
+    options = dict(out[-1])
+    options["handle_token"] = ("s", token)
+    out[-1] = options
+    return tuple(out)
+
+
 def _expected_request_path(conn, token: str) -> str:
     """Where the Response will arrive.
 
@@ -137,13 +168,7 @@ def call(interface: str, method: str, signature: str, body: tuple,
 
     token = _handle_token()
 
-    # Inject handle_token into the options dict, which portal methods always
-    # take last.
-    body = list(body)
-    options = dict(body[-1][1]) if body and isinstance(body[-1], tuple) else {}
-    options["handle_token"] = ("s", token)
-    body[-1] = ("a{sv}", options)
-    body = tuple(body)
+    body = with_handle_token(body, token, f"{interface}.{method}")
 
     try:
         conn = open_dbus_connection(bus="SESSION")

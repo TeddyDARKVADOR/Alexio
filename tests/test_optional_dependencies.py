@@ -90,7 +90,13 @@ def _module_names() -> list[str]:
     for path in sorted(ROOT.glob("actions/*.py")):
         if path.name != "__init__.py":
             names.append(f"actions.{path.stem}")
-    for path in sorted(ROOT.rglob("core/**/*.py")):
+    # glob, not rglob. `rglob("core/**/*.py")` anchors the pattern at *any*
+    # depth, so it also matched .venv/lib/python3.11/site-packages/numpy/core/
+    # — and the test then tried to import numpy's private modules by absolute
+    # name, failing with "the 'package' argument is required to perform a
+    # relative import". Sixteen failures that named a third-party package and
+    # said nothing about Alexio.
+    for path in sorted(ROOT.glob("core/**/*.py")):
         if "__pycache__" in path.parts:
             continue
         rel = path.relative_to(ROOT)

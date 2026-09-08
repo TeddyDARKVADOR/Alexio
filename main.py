@@ -711,6 +711,117 @@ def _has(exc: BaseException, kind: type) -> bool:
     return False
 
 
+def _error_text(exc: BaseException) -> str:
+    """Everything about `exc` that the branches in run() match strings against.
+
+    `str()` on the ExceptionGroup a TaskGroup raises is "unhandled errors in a
+    TaskGroup (1 sub-exception)" — a sentence containing none of the words those
+    branches look for. So every string test in the handler was blind to anything
+    that failed *inside* a live session, which is where sessions actually fail:
+    an INVALID_ARGUMENT from the enhanced-audio config or a dropped socket both
+    arrived as that same opaque line and fell through to the generic case.
+
+    The chain matters as much as the group. A websocket that stopped answering
+    pings reports it on the ConnectionClosedError, while the TimeoutError behind
+    it says only "timed out while closing connection" — reading one without the
+    other names the wrong problem.
+    """
+    seen: set[int] = set()
+    parts: list[str] = []
+
+    def walk(e: BaseException | None, depth: int = 0) -> None:
+        if e is None or depth > 8 or id(e) in seen:
+            return
+        seen.add(id(e))
+        parts.append(f"{type(e).__name__}: {e}")
+        if isinstance(e, BaseExceptionGroup):
+            for sub in e.exceptions:
+                walk(sub, depth + 1)
+        walk(e.__cause__, depth + 1)
+
+    walk(exc)
+    return "\n".join(parts)
+
+
+# How a websocket describes dying for a reason that is not a bug here: the
+# server hung up, or the connection stopped answering keepalives. Distinct from
+# a *failure to connect* (getaddrinfo, refused, no route), which deserves the
+# growing backoff below — this one is the ordinary end of a long conversation
+# and deserves a prompt, quiet reconnect.
+_TRANSPORT_DROP = (
+    "keepalive ping timeout",
+    "no close frame received",
+    "connectionclosederror",
+    "connectionclosedok",
+    "1011",                       # server-side internal error / going away
+)
+
+
+def _is_transport_drop(err_text: str) -> bool:
+    low = err_text.lower()
+    return any(tok in low for tok in _TRANSPORT_DROP)
+
+
+class _LoopLag:
+    """How late a task that asked to run every 250 ms actually ran.
+
+    The Live socket's keepalive is a plain asyncio task: it pings every 20 s and
+    closes the connection if the pong is not *processed* within 20 s more. So a
+    disconnect reading "keepalive ping timeout" has exactly two causes — the
+    network stopped answering, or this process was too busy to notice that it
+    had. From the outside they are identical, and guessing between them is how a
+    recurring disconnect stays unexplained for weeks.
+
+    R-07 says nothing blocks the loop. This is the measurement that says whether
+    the rule actually held, reported at the one moment it matters. It costs one
+    timer tick every 250 ms and holds two floats.
+    """
+
+    PERIOD = 0.25
+
+    def __init__(self) -> None:
+        self.worst = 0.0
+
+    def reset(self) -> None:
+        self.worst = 0.0
+
+    async def run(self) -> None:
+        nxt = time.monotonic() + self.PERIOD
+        while True:
+            await asyncio.sleep(max(0.0, nxt - time.monotonic()))
+            lag = time.monotonic() - nxt
+            if lag > self.worst:
+                self.worst = lag
+            # 2 s is far from fatal but far from normal: on an idle loop this
+            # measures single-digit milliseconds. Saying it early turns a future
+            # disconnect into something already half-diagnosed.
+            if lag > 2.0:
+                print(f"[JARVIS] ⚠️  Event loop blocked for {lag:.1f}s "
+                      f"— the Live keepalive dies at 20s (R-07).")
+            nxt += self.PERIOD
+
+
+def _closed_in(exc: BaseException, depth: int = 0):
+    """The SessionClosed inside `exc`, or None.
+
+    core/voice now translates every transport failure into one of these with the
+    close code attached, so the handler can say *which* disconnection happened
+    instead of matching substrings on a websockets exception it should never
+    have been shown. The string net below is kept for anything that still
+    reaches the handler another way.
+    """
+    if exc is None or depth > 8:
+        return None
+    if isinstance(exc, voice.SessionClosed):
+        return exc
+    if isinstance(exc, BaseExceptionGroup):
+        for sub in exc.exceptions:
+            got = _closed_in(sub, depth + 1)
+            if got is not None:
+                return got
+    return _closed_in(exc.__cause__, depth + 1)
+
+
 def _keep_context_of(exc: BaseException) -> bool:
     """Read `keep_context` off a reconnect signal, unwrapping the group the
     TaskGroup put it in. Defaults to True: an unexpected shape must not silently
@@ -732,6 +843,9 @@ class JarvisLive:
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
+        # Measures R-07 continuously, so a keepalive disconnect can name its
+        # own cause instead of listing the possibilities. See _LoopLag.
+        self._loop_lag            = _LoopLag()
         self._loop                = None
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
@@ -1313,10 +1427,21 @@ class JarvisLive:
                     # the warning keeps the conversation, because the resumption
                     # handle is still valid at this point.
                     left = ev.seconds_left
+                    # Only promise the conversation is kept when there is
+                    # actually a handle to keep it with. Measured: the server
+                    # issues one about seven seconds after the first completed
+                    # turn, so an early go-away can arrive before there is any —
+                    # and a message that says "without losing the conversation"
+                    # while silently starting a blank one is worse than no
+                    # message, because the user stops trusting the next one.
+                    keeps = self._resume_handle is not None
                     self.ui.write_log(
                         "SYS: Server is closing the connection"
                         + (f" in {left:.0f}s" if left else "")
-                        + " — reconnecting without losing the conversation."
+                        + (" — reconnecting without losing the conversation."
+                           if keeps else
+                           " — reconnecting (no resumption handle yet, so this "
+                           "one starts fresh).")
                     )
                     self.request_reconnect(keep_context=True, reason="server go-away")
 
@@ -1832,6 +1957,10 @@ class JarvisLive:
             self._dashboard = None
 
         while True:
+            # Whether this attempt ever had a live socket. It is the difference
+            # between "could not connect" and "was connected and lost it", which
+            # the two error paths below treat very differently.
+            _connected = False
             try:
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
@@ -1843,6 +1972,7 @@ class JarvisLive:
                 # a reconnect and breaks the next one.
                 session = voice.GeminiLiveSession(api_key=_get_api_key())
                 await session.connect(config)
+                _connected = True
 
                 async with asyncio.TaskGroup() as tg:
                     self.session          = session
@@ -1871,6 +2001,8 @@ class JarvisLive:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})
 
                     self._reconnect_event.clear()  # ignore requests from before this session
+                    self._loop_lag.reset()
+                    tg.create_task(self._loop_lag.run())
                     tg.create_task(self._watch_reconnect())
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -1930,9 +2062,44 @@ class JarvisLive:
                     self._conn_backoff = 0
                     continue
 
-                err_str = str(e)
-                print(f"[JARVIS] Error ({type(e).__name__}): {e}")
-                traceback.print_exc()
+                # Flattened: the group's own message says nothing, and every
+                # branch below matches on strings. See _error_text().
+                err_str = _error_text(e)
+
+                # A session that was up and lost its socket is not a fault, it
+                # is what happens to long-lived websockets. Printing a nine-frame
+                # traceback for it tells the user something broke when nothing
+                # did — and buries the tracebacks that do mean something.
+                #
+                # But it must say *which* disconnection it was. "Connection
+                # dropped" covers the server ending the session normally, this
+                # client giving up on a keepalive ping, and the socket vanishing
+                # — three causes, three different fixes, one indistinguishable
+                # line. That is how a recurring disconnect stays unexplained.
+                closed  = _closed_in(e)
+                dropped = _connected and (closed is not None
+                                          or _is_transport_drop(err_str))
+                if dropped:
+                    why = closed.describe() if closed is not None else "transport closed"
+                    print(f"[JARVIS] Connection dropped: {why} — reconnecting.")
+                    self.ui.write_log(f"SYS: Connection dropped ({why}) — reconnecting.")
+                    if closed is not None and closed.is_keepalive_timeout:
+                        # Naming the two possibilities is only half of it —
+                        # _LoopLag has been measuring which one it was all
+                        # along, so say that instead of listing both.
+                        lag = self._loop_lag.worst
+                        if lag > 5.0:
+                            print(f"[JARVIS]   → this process blocked its own "
+                                  f"event loop for {lag:.1f}s during the session. "
+                                  f"That is what killed the keepalive, not the "
+                                  f"network (R-07).")
+                        else:
+                            print(f"[JARVIS]   → the event loop stayed responsive "
+                                  f"(worst lag {lag*1000:.0f} ms), so no pong came "
+                                  f"back: the network stalled, not this process.")
+                else:
+                    print(f"[JARVIS] Error ({type(e).__name__}): {e}")
+                    traceback.print_exc()
 
                 # Enhanced audio features rejected by the server (preview API
                 # drift) — drop them and reconnect with the plain config.
@@ -1966,7 +2133,12 @@ class JarvisLive:
                     "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
                     "ConnectionRefusedError", "OSError", "Cannot connect",
                 ))
-                if is_net_err:
+                # `dropped` is excluded deliberately: it matches "timed out" and
+                # would double the delay every time a conversation outlived its
+                # socket, so a long chat would end up waiting a minute to come
+                # back. Backoff is for a server that will not take us, not for
+                # one that already did.
+                if is_net_err and not dropped:
                     _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                     self._conn_backoff = _conn_backoff
                     # Every other line in this log is English; this one was Turkish,

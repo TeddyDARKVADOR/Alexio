@@ -25,6 +25,9 @@ WHY THIS IS CACHED
 
 from __future__ import annotations
 
+import contextlib
+import os
+import sys
 import threading
 import time
 
@@ -116,6 +119,108 @@ _PROBE_SECONDS = {"output": 0.6, "input": 0.35}
 _probe_results: dict = {}
 
 
+@contextlib.contextmanager
+def _quiet_c_stderr():
+    """Swallow what ALSA and PortAudio print straight to file descriptor 2.
+
+    Failing to open a stream is not an accident here, it is the measurement —
+    _usable() opens every endpoint at the rate the app runs at precisely to find
+    out which ones answer. On Linux each refusal makes PortAudio print five
+    lines of C source references ("Expression 'paInvalidSampleRate' failed in
+    src/hostapi/alsa/pa_linux_alsa.c, line: 2050") and ALSA a few of its own.
+    A normal startup on this machine emitted forty of them before the app said
+    its first word — noise that names no device, suggests no fix, and is
+    indistinguishable from a crash to whoever is reading the terminal.
+
+    These come from C, not from Python: `contextlib.redirect_stderr` never sees
+    them, so the redirection has to be at the file-descriptor level. That makes
+    it process-wide for as long as it lasts, which is why it wraps individual
+    stream opens rather than the whole enumeration — anything another thread
+    writes to stderr during those milliseconds is lost, and the shorter the
+    window the smaller that bet. Everything this module wants *said* is printed
+    outside it.
+    """
+    try:
+        sys.stderr.flush()
+        saved = os.dup(2)
+    except Exception:
+        yield          # no usable fd 2 (pythonw, some services) — nothing to do
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, 2)
+        finally:
+            os.close(devnull)
+        yield
+    finally:
+        try:
+            os.dup2(saved, 2)
+        finally:
+            os.close(saved)
+
+
+# PortAudio -9985. PipeWire's ALSA plugin does not release an endpoint the
+# instant the stream that held it is closed, and _usable() closes one on this
+# very device a few milliseconds before the transport probe opens the next.
+# Measured on Fedora 43: the first probe of the microphone answered "Device
+# unavailable", the direction fell through to the next host API, and the picker
+# ended up reporting a different endpoint than the one that works. It says
+# nothing about the device — only that the question came too soon.
+_TRANSIENT = ("device unavailable", "-9985", "device or resource busy")
+
+
+def _is_transient(err: Exception) -> bool:
+    low = str(err).lower()
+    return any(tok in low for tok in _TRANSIENT)
+
+
+def _probe_once(idx: int, kind: str) -> tuple[bool, str]:
+    """One transport measurement. Returns (works, what to print — '' if fine).
+
+    Each direction is probed the way main.py actually uses it. That is not a
+    detail: DirectSound input passes a callback stream and fails a blocking
+    read, so probing the wrong mode rejected a microphone that works perfectly
+    in the app."""
+    import sounddevice as sd
+    rate = _RATES.get(kind, 16000)
+    secs = _PROBE_SECONDS.get(kind, 0.5)
+
+    if kind == "output":
+        # main.py writes with stream.write() — a real sink is rate-limited by
+        # the hardware clock, a fake one swallows the buffer instantly.
+        with _quiet_c_stderr():
+            st = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16",
+                                    blocksize=1024, device=idx)
+            st.start()
+            t0 = time.monotonic()
+            st.write(bytes(int(rate * secs) * 2))   # silence — inaudible
+            elapsed = time.monotonic() - t0
+            st.stop(); st.close()
+        if elapsed > secs * 0.5:
+            return True, ""
+        return False, (f"output: host API reports success but moves no audio "
+                       f"({elapsed*1000:.0f} ms for {secs*1000:.0f} ms) "
+                       f"— skipping it")
+
+    # main.py reads through a callback — count what arrives.
+    frames = [0]
+
+    def _cb(indata, n, *_a):
+        frames[0] += n
+
+    with _quiet_c_stderr():
+        st = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
+                            blocksize=1024, device=idx, callback=_cb)
+        st.start()
+        time.sleep(secs)
+        st.stop(); st.close()
+    if frames[0] > rate * secs * 0.3:
+        return True, ""
+    return False, (f"input: host API delivered {frames[0]} frames in "
+                   f"{secs*1000:.0f} ms — skipping it")
+
+
 def _transport_works(idx: int, kind: str, api_key) -> bool:
     """Does this host API actually move audio, or only pretend to?
 
@@ -124,51 +229,23 @@ def _transport_works(idx: int, kind: str, api_key) -> bool:
     if api_key in _probe_results:
         return _probe_results[api_key]
 
-    ok = False
-    try:
-        import sounddevice as sd
-        rate = _RATES.get(kind, 16000)
-        secs = _PROBE_SECONDS.get(kind, 0.5)
+    ok, note = False, ""
+    for attempt in (0, 1):
+        try:
+            ok, note = _probe_once(idx, kind)
+        except Exception as e:
+            ok, note = False, f"{kind} transport probe failed: {e}"
+            # One retry, and only for the busy-device transient described above.
+            # A device that is genuinely wrong for this rate fails identically
+            # twice, so this costs 200 ms on a machine that was going to fail
+            # anyway and saves the endpoint that actually works on this one.
+            if attempt == 0 and _is_transient(e):
+                time.sleep(0.2)
+                continue
+        break
 
-        # Each direction is probed the way main.py actually uses it. That is not
-        # a detail: DirectSound input passes a callback stream and fails a
-        # blocking read, so probing the wrong mode rejected a microphone that
-        # works perfectly in the app.
-        if kind == "output":
-            # main.py writes with stream.write() — a real sink is rate-limited
-            # by the hardware clock, a fake one swallows the buffer instantly.
-            st = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16",
-                                    blocksize=1024, device=idx)
-            st.start()
-            t0 = time.monotonic()
-            st.write(bytes(int(rate * secs) * 2))   # silence — inaudible
-            elapsed = time.monotonic() - t0
-            st.stop(); st.close()
-            ok = elapsed > secs * 0.5
-            if not ok:
-                print(f"[Audio] output: host API reports success but moves no "
-                      f"audio ({elapsed*1000:.0f} ms for {secs*1000:.0f} ms) "
-                      f"— skipping it")
-        else:
-            # main.py reads through a callback — count what arrives.
-            frames = [0]
-
-            def _cb(indata, n, *_a):
-                frames[0] += n
-
-            st = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                                blocksize=1024, device=idx, callback=_cb)
-            st.start()
-            time.sleep(secs)
-            st.stop(); st.close()
-            ok = frames[0] > rate * secs * 0.3
-            if not ok:
-                print(f"[Audio] input: host API delivered {frames[0]} frames in "
-                      f"{secs*1000:.0f} ms — skipping it")
-    except Exception as e:
-        print(f"[Audio] {kind} transport probe failed: {e}")
-        ok = False
-
+    if note:
+        print(f"[Audio] {note}")
     _probe_results[api_key] = ok
     return ok
 
@@ -219,21 +296,26 @@ def _usable(idx: int, kind: str) -> bool:
     try:
         import sounddevice as sd
         rate = _RATES.get(kind, 16000)
-        if kind == "input":
-            st = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
-                                blocksize=1024, device=idx,
-                                callback=lambda *_a: None)
-        else:
-            st = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16",
-                                    blocksize=1024, device=idx)
-        st.start()
+        # Silenced because being refused here is the expected half of the
+        # measurement — see _quiet_c_stderr(). Nothing is hidden that anyone
+        # could act on: what came back is the return value.
+        with _quiet_c_stderr():
+            if kind == "input":
+                st = sd.InputStream(samplerate=rate, channels=1, dtype="int16",
+                                    blocksize=1024, device=idx,
+                                    callback=lambda *_a: None)
+            else:
+                st = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16",
+                                        blocksize=1024, device=idx)
+            st.start()
         return True
     except Exception:
         return False
     finally:
         if st is not None:
             try:
-                st.stop(); st.close()
+                with _quiet_c_stderr():
+                    st.stop(); st.close()
             except Exception:
                 pass
 

@@ -99,7 +99,52 @@ class VoiceError(RuntimeError):
 
 
 class SessionClosed(VoiceError):
-    """The socket is gone. The caller should rebuild, replaying the handle."""
+    """The socket is gone. The caller should rebuild, replaying the handle.
+
+    Carries *why* it went, because "the connection dropped" is three different
+    events that need three different answers and look identical from outside:
+
+      · the server ended the session normally (code 1000/1001) — the ordinary
+        end of a long conversation, or the connection-duration limit arriving
+        without a go-away. Reconnect at once; nothing is wrong.
+      · we gave up (code 1011, "keepalive ping timeout") — *our* client closed
+        because no pong came back within 20 s. That is the network stalling or
+        this process starving its own event loop, and it is worth saying so:
+        the two have very different fixes and neither is a Gemini fault.
+      · the connection vanished (1006, no close frame) — a real break.
+
+    `by` is "server" or "client", and it is the field that matters most: it is
+    the difference between "they hung up" and "we hung up", which a message
+    reading only "connection dropped" hides. Without it main.py was reduced to
+    matching substrings on a transport exception it should never have seen.
+    """
+
+    def __init__(self, message: str, *, code: int | None = None,
+                 reason: str = "", by: str = "") -> None:
+        super().__init__(message)
+        self.code   = code
+        self.reason = reason
+        self.by     = by
+
+    @property
+    def is_keepalive_timeout(self) -> bool:
+        """We closed it ourselves because a keepalive pong never arrived."""
+        return self.by == "client" and "keepalive" in self.reason.lower()
+
+    def describe(self) -> str:
+        """One line, in the terms someone reading a log can act on."""
+        if self.is_keepalive_timeout:
+            return ("no reply to a keepalive ping for 20s — the network stalled "
+                    "or this process was too busy to answer")
+        if self.by == "server" and self.code in (1000, 1001):
+            return f"the server ended the session (code {self.code})"
+        if self.code == 1006:
+            return "the connection vanished without a close frame (code 1006)"
+        if self.code is not None:
+            who = self.by or "someone"
+            return (f"closed by {who} with code {self.code}"
+                    + (f" — {self.reason}" if self.reason else ""))
+        return str(self)
 
 
 class ResumptionRejected(VoiceError):

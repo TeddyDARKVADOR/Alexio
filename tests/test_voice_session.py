@@ -30,9 +30,24 @@ def _ns(**kw):
 
 def _content(**kw):
     base = {"output_transcription": None, "input_transcription": None,
-            "turn_complete": False, "interrupted": False}
+            "turn_complete": False, "interrupted": False, "model_turn": None}
     base.update(kw)
     return pytypes.SimpleNamespace(**base)
+
+
+def _audio(*chunks: bytes, extra_parts=()):
+    """A model turn shaped the way the SDK delivers one.
+
+    Audio does not arrive on a `data` attribute — that is a convenience property
+    the SDK computes from `server_content.model_turn.parts`, and it warns
+    whenever the turn also carries text or thoughts. This builds the real thing,
+    so the extraction is tested against the shape it actually meets.
+    """
+    parts = [pytypes.SimpleNamespace(
+        inline_data=pytypes.SimpleNamespace(data=c, mime_type="audio/pcm"))
+        for c in chunks]
+    parts += [pytypes.SimpleNamespace(inline_data=None, **p) for p in extra_parts]
+    return pytypes.SimpleNamespace(parts=parts)
 
 
 def _text(t):
@@ -107,11 +122,32 @@ async def test_audio_is_sliced_so_an_interrupt_lands_within_50ms():
     """One second of 24 kHz PCM16 is 48 000 bytes; at 50 ms a slice that is
     twenty events, so a drain of the queue stops playback almost immediately
     instead of after whatever the server happened to send in one go."""
-    s = _session_with([_ns(data=b"\x00" * 48_000)])
+    s = _session_with([_ns(server_content=_content(model_turn=_audio(b"\x00" * 48_000)))])
     events = await _drain(s)
     assert len(events) == 20
     assert all(e.kind == EventKind.AUDIO for e in events)
     assert sum(len(e.audio) for e in events) == 48_000
+
+
+@pytest.mark.asyncio
+async def test_audio_is_read_from_the_parts_even_when_the_turn_also_thinks():
+    """A native-audio model sends `text` and `thought` parts alongside the PCM.
+    The SDK's `response.data` handles that by logging a warning nobody can act
+    on, once per process, in the middle of a conversation. The audio must come
+    out whole and the non-audio parts must be dropped without a word."""
+    turn = _audio(b"\x01" * 2_400, b"\x02" * 2_400,
+                  extra_parts=({"text": "hmm"}, {"thought": True}))
+    s = _session_with([_ns(server_content=_content(model_turn=turn))])
+    events = await _drain(s)
+    assert [e.kind for e in events] == [EventKind.AUDIO, EventKind.AUDIO]
+    assert b"".join(e.audio for e in events) == b"\x01" * 2_400 + b"\x02" * 2_400
+
+
+@pytest.mark.asyncio
+async def test_a_turn_with_no_audio_parts_yields_no_audio():
+    turn = _audio(extra_parts=({"text": "just words"},))
+    s = _session_with([_ns(server_content=_content(model_turn=turn))])
+    assert await _drain(s) == []
 
 
 @pytest.mark.asyncio
@@ -167,8 +203,23 @@ async def test_go_away_is_read():
 @pytest.mark.asyncio
 async def test_go_away_survives_every_shape_of_time_left():
     """`time_left` is a protobuf Duration on some SDK versions and a plain
-    number on others; an unknown shape must still produce the event."""
+    number on others; an unknown shape must still produce the event.
+
+    The string cases are the ones that matter, and they are the ones this test
+    did not have. `LiveServerGoAway.time_left` is typed `Optional[str]` in the
+    installed SDK, and over the websocket transport the server sends a protobuf
+    Duration — `"540s"`, trailing `s` included. The old parser tried
+    `total_seconds`, then `seconds`, then `float(value)`; a string has neither
+    attribute and `float("540s")` raises, so the real shape was the only one
+    that produced `None`. Every go-away warning reached the user with the
+    countdown missing — the single number in it worth reading.
+    """
     for value, expected in [
+        ("540s", 540.0),                                  # what the server sends
+        ("10.5s", 10.5),
+        ("  42s ", 42.0),
+        ("600", 600.0),                                   # bare, seen on some builds
+        ("soon", None),                                   # unparseable stays None
         (pytypes.SimpleNamespace(seconds=30), 30.0),
         (pytypes.SimpleNamespace(total_seconds=lambda: 8.5), 8.5),
         (5, 5.0),

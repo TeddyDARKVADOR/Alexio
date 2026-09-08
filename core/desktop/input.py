@@ -328,10 +328,7 @@ class _RemoteDesktop:
         from . import portal
 
         token = "alexio_" + secrets.token_hex(8)
-        body = list(body)
-        options = dict(body[-1][1]) if body and isinstance(body[-1], tuple) else {}
-        options["handle_token"] = ("s", token)
-        body[-1] = ("a{sv}", options)
+        body = portal.with_handle_token(body, token, f"RemoteDesktop.{method}")
 
         sender = conn.unique_name.lstrip(":").replace(".", "_")
         request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
@@ -343,7 +340,7 @@ class _RemoteDesktop:
         with conn.filter(rule) as queue:
             addr = DBusAddress(portal.PORTAL_PATH, bus_name=portal.PORTAL_BUS,
                                interface="org.freedesktop.portal.RemoteDesktop")
-            msg = new_method_call(addr, method, signature, tuple(body))
+            msg = new_method_call(addr, method, signature, body)
             try:
                 conn.send_and_get_reply(msg, timeout=timeout)
             except Exception as e:
