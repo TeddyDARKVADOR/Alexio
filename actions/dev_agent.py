@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 import sys
 import json
@@ -6,6 +7,7 @@ import time
 from pathlib import Path
 
 from core import desktop
+from core.paths import PathEscape, safe_join
 from core.undo import push_undo
 
 
@@ -19,15 +21,21 @@ BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
-MODEL_PLANNER    = "gemini-flash-latest"
-MODEL_WRITER     = "gemini-flash-latest"
 
-def _get_model(model_name: str = MODEL_WRITER, task: str = "dev_agent"):
+
+def _get_model(task: str = "dev_agent"):
     """Kept as a shim so this file's call sites stay untouched; everything behind
     it now goes through core/ai.
 
     Building a whole project is the one job in Alexio that genuinely deserves the
     deep tier — it plans, writes several files, then reads its own errors back.
+
+    R-02: this used to take a `model_name` defaulting to MODEL_WRITER, a
+    module-level "gemini-flash-latest". Both constants were **dead** — the shim
+    ignored the argument entirely and routed on the tier — so they pinned
+    nothing while looking exactly like configuration, and the router could not
+    see this module at all. What actually distinguishes these three call sites
+    is the *task*, which is what logs/ai_calls.jsonl is keyed on.
     """
     from core import ai
 
@@ -107,7 +115,7 @@ class RateLimitError(Exception):
 
 
 def _plan_project(description: str, language: str) -> dict:
-    model = _get_model(MODEL_PLANNER)
+    model = _get_model("dev_agent.plan")
 
     prompt = f"""You are a senior software architect. Create a minimal, complete file plan for this project.
 
@@ -163,7 +171,7 @@ def _write_file(
     project_dir: Path,
     already_written: dict[str, str],
 ) -> str:
-    model = _get_model(MODEL_WRITER)
+    model = _get_model("dev_agent.write_file")
 
     file_path = file_info["path"]
     file_desc = file_info.get("description", "")
@@ -227,7 +235,12 @@ Code for {file_path}:"""
         response = model.generate_content(prompt)
         code = _strip_fences(response.text)
 
-        full_path = project_dir / file_path
+        # `project_dir / file_path` was the whole check, and it is not one:
+        # the planner writes file_path, and pathlib discards project_dir
+        # entirely when the tail is absolute. A plan naming "/etc/cron.d/x"
+        # wrote to /etc/cron.d/x. Rule n° 5 of the prompt above asks the model
+        # for relative paths; asking is not enforcing.
+        full_path = safe_join(project_dir, file_path)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(code, encoding="utf-8")
 
@@ -330,9 +343,12 @@ def _open_vscode(project_dir: Path) -> bool:
     ]
     for cmd in vscode_candidates:
         try:
+            # No shell=True. A list *with* a shell is the worst of both: POSIX
+            # hands only the first element to `sh -c` and silently drops the
+            # project path, so the editor would open on nothing. Without it the
+            # list is argv, which is what was meant all along.
             subprocess.Popen(
                 [cmd, str(project_dir)],
-                shell=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
@@ -346,7 +362,13 @@ def _open_vscode(project_dir: Path) -> bool:
 def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
     try:
-        parts = run_command.split()
+        # shlex.split, not .split(): the string is written by the planner model,
+        # and whitespace is not a grammar — quoting, escaping and embedded
+        # arguments all meant whatever the spaces happened to say. shlex is the
+        # parser that string was always pretending to have been through.
+        parts = shlex.split(run_command)
+        if not parts:
+            return "The plan gave no command to run."
         if parts[0].lower() in ("python", "python3", "py"):
             # The project's interpreter, not Alexio's — so generated code sees
             # the packages that were installed for it and nothing else. Falling
@@ -428,7 +450,7 @@ def _fix_files(
     entry_point: str,
 ) -> dict[str, str]:
 
-    model = _get_model(MODEL_PLANNER)
+    model = _get_model("dev_agent.fix_file")
 
     error_file, error_line = _parse_traceback(error_output, list(file_codes.keys()))
     error_type = _classify_error(error_output)
@@ -493,7 +515,7 @@ Fixed code for {fix_path}:"""
             response = model.generate_content(prompt)
             fixed = _strip_fences(response.text)
 
-            full_path = project_dir / fix_path
+            full_path = safe_join(project_dir, fix_path)
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(fixed, encoding="utf-8")
 
@@ -589,6 +611,11 @@ def _build_project(
                     time.sleep(20)
                 else:
                     log(f"Rate limit retry failed for {file_path}, skipping.")
+            except PathEscape as e:
+                # One hostile path must not stop the other files being written:
+                # the plan is usually fine and this one entry is not.
+                log(f"Refused {file_path}: {e}")
+                break
             except Exception as e:
                 log(f"Failed to write {file_path}: {e}")
                 break

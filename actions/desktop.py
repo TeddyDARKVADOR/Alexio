@@ -13,6 +13,7 @@ from datetime import datetime
 # has a local `desktop` holding a *path*. Two different things with one name in
 # generated code is a bug waiting for a slow afternoon.
 from core import desktop as core_desktop
+from core.undo import push_undo
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -33,6 +34,29 @@ def _get_desktop() -> Path:
         if xdg and Path(xdg).exists():
             return Path(xdg)
     return Path.home() / "Desktop"
+
+def _undo_moves(journal: list[tuple[Path, Path]]):
+    """Put every file back where it was. Used by both desktop reorganisers.
+
+    Returns a callable rather than doing the work, because core/undo.py stores
+    it and runs it later — and reports how many it could not restore instead of
+    claiming a clean reversal it did not achieve.
+    """
+    def _restore() -> str:
+        back = failed = 0
+        for origin, moved_to in reversed(journal):
+            try:
+                if moved_to.exists():
+                    origin.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(moved_to), str(origin))
+                    back += 1
+            except Exception:
+                failed += 1
+        if failed:
+            return f"Put {back} files back; {failed} could not be restored."
+        return f"Put {back} files back where they were."
+    return _restore
+
 
 def _build_sandbox() -> dict:
     import time
@@ -181,10 +205,12 @@ def set_wallpaper(image_path: str) -> str:
             if path.suffix.lower() in {".webp", ".png"}:
                 try:
                     from PIL import Image
-                    bmp_path = Path(tempfile.mktemp(suffix=".bmp"))
+                    _fd, _name = tempfile.mkstemp(suffix=".bmp")
+                    os.close(_fd)
+                    bmp_path = Path(_name)
                     Image.open(path).convert("RGB").save(bmp_path, "BMP")
                     path = bmp_path
-                except ImportError:
+                except Exception:
                     pass 
             ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3)
             return f"Wallpaper set: {path.name}"
@@ -256,7 +282,9 @@ def set_wallpaper_from_url(url: str) -> str:
     try:
         import urllib.request
         suffix = Path(url.split("?")[0]).suffix or ".jpg"
-        tmp    = Path(tempfile.mktemp(suffix=suffix))
+        _fd, _name = tempfile.mkstemp(suffix=suffix)
+        os.close(_fd)
+        tmp    = Path(_name)
         urllib.request.urlretrieve(url, str(tmp))
         result = set_wallpaper(str(tmp))
         try:
@@ -325,6 +353,7 @@ def organize_desktop(mode: str = "by_type") -> str:
     desktop       = _get_desktop()
     skip_exts     = _SKIP_EXTENSIONS.get(_OS, set())
     moved, skipped = [], []
+    journal: list[tuple[Path, Path]] = []
 
     for item in desktop.iterdir():
         if item.is_dir() or item.name.startswith("."):
@@ -351,8 +380,19 @@ def organize_desktop(mode: str = "by_type") -> str:
             skipped.append(item.name)
             continue
 
+        origin = item.resolve()
         shutil.move(str(item), str(new_path))
+        journal.append((origin, new_path.resolve()))
         moved.append(f"{item.name} → {folder_name}/")
+
+    # R-05. core/tool_policy.py lets desktop_control run ungated *because* it is
+    # reversible; that was a claim about a module which never called push_undo,
+    # so `undo` could not reach a single one of these moves.
+    # actions/file_controller.py::organize_desktop has journalled them all along
+    # — same work, same desktop, one of the two keeping the promise.
+    if journal:
+        push_undo(f"organized the desktop ({len(journal)} files)",
+                  _undo_moves(journal))
 
     result = f"Desktop organized ({mode}): {len(moved)} files moved."
     if moved:
@@ -396,7 +436,7 @@ def clean_desktop() -> str:
     archive_dir = desktop / f"Desktop Archive {today}"
     archive_dir.mkdir(exist_ok=True)
 
-    moved = 0
+    journal: list[tuple[Path, Path]] = []
     for item in desktop.iterdir():
         if item.is_dir() or item.name.startswith("."):
             continue
@@ -404,10 +444,16 @@ def clean_desktop() -> str:
             continue
         new_path = archive_dir / item.name
         if not new_path.exists():
+            origin = item.resolve()
             shutil.move(str(item), str(new_path))
-            moved += 1
+            journal.append((origin, new_path.resolve()))
 
-    return f"Desktop cleaned: {moved} files archived to '{archive_dir.name}'."
+    if journal:
+        push_undo(f"archived {len(journal)} desktop files",
+                  _undo_moves(journal))
+
+    return (f"Desktop cleaned: {len(journal)} files archived to "
+            f"'{archive_dir.name}'.")
 
 
 def get_desktop_stats() -> str:

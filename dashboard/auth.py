@@ -81,6 +81,7 @@ FAIL_LIMIT    = 5             # per address, per window
 FAIL_WINDOW   = 60.0
 BURN_LIMIT    = 20            # failures across all addresses before…
 BURN_WINDOW   = 300.0         # …every pending PIN is thrown away
+MAX_TRACKED   = 512           # addresses remembered at once — see Throttle
 
 # The PIN alphabet drops O/I/L/0/1 — six characters read aloud or off a screen
 # have to survive being misread. 31 symbols, six positions: ~2^29.7.
@@ -146,10 +147,21 @@ class Throttle:
     _global: list[float]            = field(default_factory=list)
 
     def retry_after(self, who: str, now: float | None = None) -> float:
-        """Seconds the caller must wait, or 0.0 when it may try now."""
+        """Seconds the caller must wait, or 0.0 when it may try now.
+
+        This used to write `self._fails[who] = hits` unconditionally, including
+        when `hits` was empty — so every address that merely *asked* left an
+        entry behind, on a path reachable without any credential, and nothing
+        ever removed it. `clear()` pops on success and `prune()` never touched
+        it, so the only inputs that shrank the dictionary were the ones that
+        were never the problem.
+        """
         now  = time.time() if now is None else now
         hits = [t for t in self._fails.get(who, []) if now - t < self.window]
-        self._fails[who] = hits
+        if hits:
+            self._fails[who] = hits
+        else:
+            self._fails.pop(who, None)     # nothing to remember about this one
         if len(hits) < self.limit:
             return 0.0
         return max(0.0, self.window - (now - hits[0]))
@@ -159,11 +171,29 @@ class Throttle:
         been crossed and every pending PIN should be burned."""
         now = time.time() if now is None else now
         self._fails.setdefault(who, []).append(now)
+        self._forget_stale(now)          # after the append, so the cap holds
         self._global = [t for t in self._global if now - t < BURN_WINDOW] + [now]
         return len(self._global) >= BURN_LIMIT
 
     def clear(self, who: str) -> None:
         self._fails.pop(who, None)
+
+    def _forget_stale(self, now: float) -> None:
+        """Drop windows that have expired, and cap what is left.
+
+        The cap is the part that matters: expiry alone bounds nothing against
+        somebody arriving from a new address every second. Evicting the address
+        with the oldest failure costs that address its accumulated count, which
+        is the right trade — an attacker who can spend 512 distinct source
+        addresses has already defeated a per-address limit, and the global burn
+        counter is what actually protects the PIN.
+        """
+        for key in [k for k, v in self._fails.items()
+                    if not v or now - v[-1] >= self.window]:
+            del self._fails[key]
+        while len(self._fails) > MAX_TRACKED:
+            oldest = min(self._fails, key=lambda k: self._fails[k][-1])
+            del self._fails[oldest]
 
 
 class CredentialStore:
@@ -264,6 +294,17 @@ class CredentialStore:
 
     # ── paired devices ───────────────────────────────────────────────────────
 
+    def _sessions_of(self, secret: str) -> list[str]:
+        """Bearer hashes whose session carries this device's key material.
+
+        open_session_for_device copies the device's secret onto the new
+        session, which is what lets a returning phone read what it encrypted
+        earlier — and it is also the only link back from a device to the
+        sessions it opened.
+        """
+        return [h for h, s in self._sessions.items()
+                if secrets.compare_digest(s.secret, secret)]
+
     def pair_device(self, session: Session) -> str:
         """Remember this phone so it can reconnect without the PIN.
 
@@ -305,7 +346,29 @@ class CredentialStore:
         return bearer, nav, session
 
     def revoke_devices(self) -> int:
+        """Forget every paired phone AND close the sessions they opened.
+
+        Dropping the device tokens alone was not a revocation. A phone that had
+        reconnected in the last twelve hours still held a live bearer token, and
+        every use slid its window forward — so "revoke" left a stolen handset
+        with full API access for up to seven days, which is the exact threat
+        this module's header says the feature exists to answer.
+
+        tests/test_dashboard_security.py::test_revoking_devices_actually_revokes_them
+        passed throughout: it asserted the dictionary was emptied, which is not
+        what "revoke" means to the person pressing the button.
+        """
+        secrets_to_kill = {d.secret for d in self._devices.values()}
         count, self._devices = len(self._devices), {}
+
+        for secret in secrets_to_kill:
+            for bearer_hash in self._sessions_of(secret):
+                del self._sessions[bearer_hash]
+
+        # A navigation cookie outliving its bearer would keep serving the page.
+        self._navs = {n: b for n, b in self._navs.items() if b in self._sessions}
+        self._tickets = {h: v for h, v in self._tickets.items()
+                         if v[0] in self._sessions}
         return count
 
     def device_count(self) -> int:

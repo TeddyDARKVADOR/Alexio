@@ -79,10 +79,35 @@ class ModelSpec:
 
     @property
     def latency_ms(self) -> float:
-        """Best available estimate — observed if there is enough of it."""
+        """The typical call, observed if there is enough of it.
+
+        COMPARE LIKE WITH LIKE
+            This returned `measured.latency_p95` while falling back to
+            `declared.typical_latency_ms` — a p95 and a median, in the same
+            property, feeding the same comparison in router.candidates(). The
+            effect was invisible until the fifth call and then abrupt: a model
+            whose median is 650 ms, comfortably inside Budget.conversation()'s
+            900 ms, started failing the filter the moment its p95 of 1400 ms
+            replaced the declared 700. Measuring a provider made the router
+            *stop* being able to use it.
+
+            The declared number is documented as typical, so the measured
+            counterpart is p50. The tail is not discarded — it is a different
+            question, asked separately by `latency_p95_ms` below.
+        """
+        if self.measured.trustworthy and self.measured.latency_p50 > 0:
+            return self.measured.latency_p50
+        return float(self.declared.typical_latency_ms)
+
+    @property
+    def latency_p95_ms(self) -> float:
+        """The bad call. For a caller who cares about the tail rather than the
+        middle — a worst-case budget is a real thing to want, and it should say
+        so rather than being smuggled in through the typical one."""
         if self.measured.trustworthy and self.measured.latency_p95 > 0:
             return self.measured.latency_p95
-        return float(self.declared.typical_latency_ms)
+        # No tail observed yet: assume the shape the vendors' own numbers imply.
+        return float(self.declared.typical_latency_ms) * 2.5
 
     def cost_estimate(self, tokens_in: int, tokens_out: int,
                       cached_in: int = 0) -> float:

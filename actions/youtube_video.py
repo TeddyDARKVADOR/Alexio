@@ -17,7 +17,7 @@ from urllib.parse import quote_plus
 try:
     import numpy as np
     _NUMPY = True
-except ImportError:
+except Exception:
     _NUMPY = False
 
 try:

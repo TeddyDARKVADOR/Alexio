@@ -24,6 +24,7 @@ THE SHAPE
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -90,11 +91,17 @@ class ToolSpec:
             "parameters": _convert_types(self.parameters, _JSON_TO_GEMINI),
         }
 
+    # deepcopy on both: `to_gemini` builds a new document as a side effect of
+    # converting the type names, and these two used to hand out `self.parameters`
+    # itself. A provider adapter that normalises the schema it was given —
+    # adding a "required" key, lowercasing a type — then edited the ToolSpec
+    # every other adapter reads next. The dialects are documented as pure
+    # functions of the neutral form; a shared dict makes them anything but.
     def to_anthropic(self) -> dict:
         return {
             "name": self.name,
             "description": self.description,
-            "input_schema": self.parameters,
+            "input_schema": copy.deepcopy(self.parameters),
         }
 
     def to_openai(self) -> dict:
@@ -103,7 +110,7 @@ class ToolSpec:
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": copy.deepcopy(self.parameters),
             },
         }
 

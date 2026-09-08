@@ -115,9 +115,29 @@ def test_declared_latency_is_used_until_there_is_evidence():
 
 
 def test_measured_latency_wins_once_there_are_enough_samples():
+    """Observation beats documentation — but of the *same* statistic.
+
+    This asserted `latency_ms == 4200` from a p95, while the declared value it
+    replaces (`typical_latency_ms`) is a median. A model whose median was 650 ms,
+    well inside Budget.conversation()'s 900 ms, started failing the filter the
+    moment its p95 of 1400 replaced the declared 700: measuring a provider made
+    the router stop being able to use it. The intent of this test is unchanged;
+    the statistic it reads is now the one it is compared against.
+    """
     s = _spec(latency=1500,
-              measured=Measured(calls=registry.MIN_SAMPLES, latency_p95=4200))
-    assert s.latency_ms == 4200
+              measured=Measured(calls=registry.MIN_SAMPLES,
+                                latency_p50=900, latency_p95=4200))
+    assert s.latency_ms == 900
+
+
+def test_the_tail_is_still_available_to_anyone_who_asks_for_it():
+    """Dropping p95 from the typical estimate does not discard it — a worst-case
+    budget is a real thing to want, and it should say so rather than being
+    smuggled in through the median."""
+    s = _spec(latency=1500,
+              measured=Measured(calls=registry.MIN_SAMPLES,
+                                latency_p50=900, latency_p95=4200))
+    assert s.latency_p95_ms == 4200
 
 
 def test_cached_input_is_priced_at_a_tenth():

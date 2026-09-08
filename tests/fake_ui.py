@@ -33,6 +33,7 @@ class FakeUI:
         self.states:        list[str] = []
         self.contents:      list[tuple[str, str]] = []
         self.confirms:      list[tuple[str, str]] = []
+        self.confirm_hides: int = 0
         self.audio_levels:  list[float] = []
         self.camera_frames: int = 0
         self.camera_open:   bool = False
@@ -91,7 +92,10 @@ class FakeUI:
         self.confirms.append((str(title), str(detail)))
 
     def hide_confirm(self) -> None:
-        pass
+        # Counted, not ignored: an expired confirmation must take its own
+        # banner down, and a double that records only shows cannot see that
+        # happen. core/confirm.py never called this on expiry at all.
+        self.confirm_hides += 1
 
     def set_audio_level(self, level: float) -> None:
         self.audio_levels.append(float(level))

@@ -19,6 +19,8 @@ all. Every Windows-only import is inside the function that needs it.
 
 from __future__ import annotations
 
+import os
+
 import math
 import platform
 import shutil
@@ -246,7 +248,9 @@ def set_wallpaper(path: str | Path) -> None:
             import tempfile
 
             from PIL import Image
-            bmp = Path(tempfile.mktemp(suffix=".bmp"))
+            _fd, _name = tempfile.mkstemp(suffix=".bmp")
+            os.close(_fd)
+            bmp = Path(_name)
             Image.open(target).convert("RGB").save(bmp, "BMP")
             target = bmp
         except Exception:

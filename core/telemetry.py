@@ -216,23 +216,59 @@ def _percentile(sorted_values: list[float], q: float) -> float:
     return sorted_values[k]
 
 
+# How many rows the router is allowed to look at. The registry needs a recent
+# picture, not a complete one: 5 000 calls is weeks of ordinary use, and the p50
+# of the last 5 000 is a better answer than the p50 of everything since March
+# anyway — a provider that got faster in June should not be judged on May.
+ROUTING_WINDOW = 5_000
+
+# Bytes to seek back for that many rows. Lines average ~260 bytes; 512 is
+# generous enough that the window is reached in one read on any realistic log.
+_BYTES_PER_ROW = 512
+
+
+def _tail_lines(path: Path, limit: int | None) -> list[str]:
+    """The last `limit` lines, without reading what comes before them."""
+    if limit is None:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.readlines()
+
+    want = limit * _BYTES_PER_ROW
+    size = path.stat().st_size
+    with open(path, "rb") as f:
+        if size > want:
+            f.seek(size - want)
+            f.readline()                    # discard the partial first line
+        chunk = f.read()
+    return chunk.decode("utf-8", errors="replace").splitlines()
+
+
 def read_rows(limit: int | None = None) -> list[dict]:
     """Load rows newest-last. Malformed lines are skipped, not fatal — a torn
-    write at the end of a crashed run must not blind the router."""
+    write at the end of a crashed run must not blind the router.
+
+    `limit` now bounds the *reading*, not just the returned list. It used to
+    slice after parsing everything, so `summarise()` — which
+    core/ai/registry.load() calls on every routing decision — parsed both log
+    generations in full on the hot path of every model call. Measured at the
+    16 MB rotation threshold: 491 ms per ai.generate(), and roughly a second
+    once the rotated file was full too. Budget.conversation() allows 900 ms in
+    total, so choosing the model cost more than calling it.
+    """
     rows: list[dict] = []
+    per_file = limit  # each generation may contribute at most this many
     for path in (LOG_PATH.with_suffix(".jsonl.1"), LOG_PATH):
         try:
             if not path.exists():
                 continue
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rows.append(json.loads(line))
-                    except Exception:
-                        continue
+            for line in _tail_lines(path, per_file):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
         except Exception:
             continue
     return rows[-limit:] if limit else rows
@@ -247,7 +283,7 @@ def summarise(min_samples: int = 5) -> dict[tuple[str, str], dict]:
     `declared` values are the honest answer until there is evidence.
     """
     buckets: dict[tuple[str, str], list[dict]] = {}
-    for r in read_rows():
+    for r in read_rows(limit=ROUTING_WINDOW):
         key = (r.get("provider", "?"), r.get("model", "?"))
         buckets.setdefault(key, []).append(r)
 

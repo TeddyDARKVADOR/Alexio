@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "Violations that existed when tools/jarvis_lint landed (2026-09-08).",
+    "This is a ledger of known debt, not an ignore-list: the test fails on",
+    "anything NOT listed here, so new code cannot add to it. Fixing a defect",
+    "means deleting its line. An entry that no longer reproduces is itself an",
+    "error — run `python -m tools.jarvis_lint --check-stale`."
+  ],
+  "known": {
+    "JAR016|actions/code_helper.py|_screen_debug_action:unlink": ".unlink() destroys or displaces something and this module never calls push_undo. Either register the reversal (core/undo.py), or say so in core/tool_policy.py and gate the tool — R-05 has no third option.",
+    "JAR016|actions/game_updater.py|_cancel_scheduled_update:unlink": ".unlink() destroys or displaces something and this module never calls push_undo. Either register the reversal (core/undo.py), or say so in core/tool_policy.py and gate the tool — R-05 has no third option.",
+    "JAR016|actions/reminder.py|_schedule_windows:unlink": ".unlink() destroys or displaces something and this module never calls push_undo. Either register the reversal (core/undo.py), or say so in core/tool_policy.py and gate the tool — R-05 has no third option.",
+    "JAR016|actions/reminder.py|_schedule_mac:unlink": ".unlink() destroys or displaces something and this module never calls push_undo. Either register the reversal (core/undo.py), or say so in core/tool_policy.py and gate the tool — R-05 has no third option.",
+    "JAR016|actions/reminder.py|reminder:unlink": ".unlink() destroys or displaces something and this module never calls push_undo. Either register the reversal (core/undo.py), or say so in core/tool_policy.py and gate the tool — R-05 has no third option.",
+    "JAR005|main.py|_receive_audio:self._vision_close_pending": "self._vision_close_pending is raised inside a try whose finally does not lower it, so any exception on the path below leaves it set for the life of the process. Clear it in a finally, or hold it with a contextmanager."
+  }
+}

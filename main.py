@@ -1233,27 +1233,45 @@ class JarvisLive:
                     print(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
                     result = "Vision is still processing the previous request. I will not call this again."
                 else:
+                    # The flag is raised here and lowered by the TURN_COMPLETE
+                    # branch once the image has gone into the conversation. If
+                    # the capture *fails* — a refused Wayland portal, a camera
+                    # that is not there — control used to jump straight to the
+                    # except at the bottom of this method with `_pending_vision`
+                    # never set, so neither of those two release points was ever
+                    # reached and the only remaining reset was the next
+                    # reconnect. One denied portal dialog and vision answered
+                    # "still processing the previous request" for the rest of the
+                    # session. The `finally` below is the whole fix: it lowers
+                    # the flag on every path that did not hand it on.
                     self._vision_busy      = True
                     self._vision_last_time = _now
-                    angle     = args.get("angle", "screen").lower()
-                    user_text = args.get("text", "What do you see?")
-                    if angle == "camera":
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
-                        self.ui.start_camera_stream()
-                        self._vision_cam_active = True
-                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
-                        _stall = "camera"
-                    else:
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
-                        print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
-                        _stall = "screen"
-                    self._pending_vision = (img_b, mime_t, user_text, angle)
-                    result = (
-                        f"[VISION_ACTIVE] {_stall.capitalize()} captured. "
-                        f"Immediately say ONE short natural sentence in the user's own language, "
-                        f"telling them you are looking at their {_stall} right now. "
-                        f"Do NOT describe or guess content — the actual image arrives in the NEXT message."
-                    )
+                    _handed_on = False
+                    try:
+                        angle     = args.get("angle", "screen").lower()
+                        user_text = args.get("text", "What do you see?")
+                        if angle == "camera":
+                            img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
+                            self.ui.start_camera_stream()
+                            self._vision_cam_active = True
+                            print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                            _stall = "camera"
+                        else:
+                            img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
+                            print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
+                            _stall = "screen"
+                        self._pending_vision = (img_b, mime_t, user_text, angle)
+                        _handed_on = True
+                        result = (
+                            f"[VISION_ACTIVE] {_stall.capitalize()} captured. "
+                            f"Immediately say ONE short natural sentence in the user's own language, "
+                            f"telling them you are looking at their {_stall} right now. "
+                            f"Do NOT describe or guess content — the actual image arrives in the NEXT message."
+                        )
+                    finally:
+                        if not _handed_on:
+                            self._vision_busy       = False
+                            self._vision_cam_active = False
 
             elif name == "close_camera":
                 self.ui.stop_camera_stream()
@@ -1293,11 +1311,25 @@ class JarvisLive:
 
             else:
                 if self._plugin_registry.has(name):
-                    r = await loop.run_in_executor(
-                        None,
-                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
-                    )
-                    result = r or "Done."
+                    # The gate, for plugins too. This branch consulted nothing:
+                    # core/tool_policy.register() exists *only* so a plugin can
+                    # declare a CONFIRM rule — it loads after the table, so it
+                    # cannot use the decorator — and a plugin that registered
+                    # one ran anyway, because the two gate calls above both sit
+                    # inside `if handler is not None:` and this branch is
+                    # reached precisely when handler is None. The rule was
+                    # present, above the call, and guarded nothing (R-18).
+                    def _run_plugin(n=name, a=args) -> str:
+                        return self._plugin_registry.run(
+                            n, a, player=self.ui, session_memory=None,
+                            speak=self.speak)
+
+                    parked = tool_policy.gate(name, args, _run_plugin)
+                    if parked is not None:
+                        result = parked
+                    else:
+                        r = await loop.run_in_executor(None, _run_plugin)
+                        result = r or "Done."
                 else:
                     result = f"Unknown tool: {name}"
 
@@ -2125,7 +2157,11 @@ class JarvisLive:
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
                     print("[JARVIS] New API key saved — reconnecting...")
-                    _conn_backoff = 3
+                    # self., not a local: the bare name was written and never
+                    # read, so the backoff a failing key had built up survived
+                    # the fix and the first retry after re-entering a valid key
+                    # still waited out the old delay.
+                    self._conn_backoff = 3
                     continue
 
                 # Network / timeout errors — log clearly and back off

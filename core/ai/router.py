@@ -114,12 +114,18 @@ def candidates(budget: Budget,
     rows = load(catalogue)
     fits: list[ModelSpec] = []
     reasons: list[str] = []
+    unreachable: set[str] = set()
 
     for spec in rows:
         label = f"{spec.provider}/{spec.model}"
 
         if available is not None and spec.provider not in available:
-            continue                                    # not an interesting reason
+            # Not an interesting reason *per model* — but when it is the reason
+            # for every model, it is the only thing worth saying. A fresh install
+            # with no API key was told "the catalogue is empty", which named the
+            # wrong cause on the single most common failure there is.
+            unreachable.add(spec.provider)
+            continue
         if budget.tier not in spec.tiers:
             continue
         if not budget.needs <= spec.declared.capabilities:
@@ -153,6 +159,10 @@ def candidates(budget: Budget,
     ))
 
     if not fits:
+        if not reasons and unreachable:
+            reasons = [f"no credentials on this machine for "
+                       f"{', '.join(sorted(unreachable))} — add a key to "
+                       f"config/api_keys.json, or install the local model"]
         raise NoModelFits(budget, reasons)
     return fits
 

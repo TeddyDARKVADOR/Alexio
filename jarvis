@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Alexio's development interface.  ./jarvis help
+#
+# The venv is pinned deliberately: R-«Environnement» says the app runs on the
+# pyenv 3.11 venv, never the system 3.14, and a tool that quietly used the wrong
+# interpreter would report on a different tree than the one that runs.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+py="$here/.venv/bin/python"
+if [[ ! -x "$py" ]]; then
+  echo "No .venv at $here/.venv — create it, then: .venv/bin/pip install -r requirements-dev.txt" >&2
+  exit 2
+fi
+exec "$py" -m tools.jarvis_cli "$@"

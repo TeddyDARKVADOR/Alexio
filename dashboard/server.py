@@ -62,7 +62,7 @@ try:
                                    RedirectResponse, Response)
     import uvicorn
     _DEPS_OK = True
-except ImportError:
+except Exception:
     pass
 
 # python-multipart is required for file uploads — optional dependency
@@ -155,6 +155,30 @@ def _digest_ok(data: bytes) -> bool:
     return secrets.compare_digest(
         base64.b64encode(hashlib.sha512(data).digest()).decode(), _CRYPTOJS_SHA512
     )
+
+
+# (mtime, size) of the copy last verified. The file is written once by
+# _ensure_crypto_js and then served on every page load; re-reading and
+# re-hashing 50 kB per request bought nothing, because a file that changed would
+# change its mtime too. Keyed on the stat rather than a plain flag so a
+# replacement is still caught.
+_verified_stat: tuple[float, int] | None = None
+
+
+def _cached_digest_ok(path: Path) -> bool:
+    global _verified_stat
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    key = (st.st_mtime, st.st_size)
+    if _verified_stat == key:
+        return True
+    if _digest_ok(path.read_bytes()):
+        _verified_stat = key
+        return True
+    _verified_stat = None
+    return False
 
 
 def _ensure_crypto_js() -> bool:
@@ -344,7 +368,7 @@ def _ensure_certs() -> bool:
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
         from cryptography.x509.oid import NameOID
-    except ImportError:
+    except Exception:
         print("[Dashboard] cryptography not installed — serving over plain HTTP.")
         print("[Dashboard] For HTTPS run:  pip install cryptography")
         return False
@@ -424,6 +448,7 @@ class DashboardServer:
         self._phone_audio_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
         self._uploads_root                = UPLOADS_DIR.resolve()
+        self._startup_tasks: list          = []
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
         self.app                          = self._build_app()
@@ -582,7 +607,7 @@ class DashboardServer:
             page that silently loses its encryption is worse than one that says
             NO ENC in the corner — which is what the client does when this 404s.
             """
-            if _CRYPTOJS_FILE.exists() and _digest_ok(_CRYPTOJS_FILE.read_bytes()):
+            if _CRYPTOJS_FILE.exists() and _cached_digest_ok(_CRYPTOJS_FILE):
                 return FileResponse(str(_CRYPTOJS_FILE),
                                     media_type="application/javascript")
             return JSONResponse({"error": "crypto bundle unavailable"}, status_code=503)
@@ -634,48 +659,72 @@ class DashboardServer:
             _set_nav_cookie(req, resp, nav)
             return resp
 
-        @app.get("/auto-login")
-        async def auto_login(req: Request, key: str = ""):
-            """QR code target — validates one-time key, creates session, redirects phone."""
-            if self._creds.throttle.retry_after(_who(req)) > 0 or \
-                    not self._creds.redeem_pairing_key(key.strip().upper()):
-                if key:
-                    _note_failure(req)
-                return HTMLResponse("""<!DOCTYPE html>
+        @app.get("/auto-login", response_class=HTMLResponse)
+        async def auto_login_page(req: Request, key: str = ""):
+            """QR code target. Renders; it does not spend anything.
+
+            This used to redeem the pairing PIN, mint a session and pair a
+            device — all on a GET. A browser prefetching the QR link, a crawler,
+            a chat client generating a link preview, or a security scanner would
+            each burn a live single-use credential just by looking at it, and
+            the user would be told the link had expired.
+
+            GET is the one verb the network issues without being asked, so the
+            page now only carries the key to the POST below. The trip costs one
+            round-trip on the phone and nothing anywhere else.
+            """
+            safe_key = re.sub(r"[^A-Z0-9]", "", key.strip().upper())[:6]
+            return HTMLResponse(f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
-  body{background:#07090f;color:#dde3ed;font-family:sans-serif;
-       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}
-  h2{color:#f87171;margin-bottom:12px}p{color:#5e6a7e;font-size:14px}
+  body{{background:#07090f;color:#dde3ed;font-family:sans-serif;
+       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}}
+  h2{{color:#f87171;margin-bottom:12px}}p{{color:#5e6a7e;font-size:14px}}
 </style></head>
-<body><div><h2>Link Expired</h2>
-<p>Press <strong style="color:#dde3ed">Remote Control</strong> in JARVIS to get a new QR code.</p>
-</div></body></html>""")
+<body><div id="s"><p>Connecting to JARVIS…</p></div>
+<script>
+  fetch('/auto-login', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{key: '{safe_key}'}})
+  }}).then(function(r){{ return r.ok ? r.json() : Promise.reject(r); }})
+    .then(function(d){{
+      sessionStorage.setItem('jarvis_token', d.token);
+      sessionStorage.setItem('jarvis_secret', d.secret);
+      localStorage.setItem('jarvis_device_token', d.device);
+      location.replace('/');
+    }})
+    .catch(function(){{
+      document.getElementById('s').innerHTML =
+        '<h2>Link Expired</h2><p>Press <strong style="color:#dde3ed">Remote Control</strong>'
+        + ' in JARVIS to get a new QR code.</p>';
+    }});
+</script>
+</body></html>""")
+
+        @app.post("/auto-login")
+        async def auto_login(req: Request):
+            """Spend the pairing key. POST, because this changes state."""
+            if self._creds.throttle.retry_after(_who(req)) > 0:
+                return JSONResponse({"ok": False}, status_code=429)
+            try:
+                body = await req.json()
+            except Exception:
+                return JSONResponse({"ok": False}, status_code=400)
+
+            key = str(body.get("key", "")).strip().upper()
+            if not self._creds.redeem_pairing_key(key):
+                if key:
+                    _note_failure(req)
+                return JSONResponse({"ok": False, "error": "Invalid or expired key"},
+                                    status_code=401)
 
             self._creds.throttle.clear(_who(req))
             bearer, nav, session = self._creds.open_session()
             device = self._creds.pair_device(session)
             _connected("Remote connection established via QR code.")
-
-            # The three values below are server-minted url-safe tokens and
-            # base64 — no user input reaches this template, which is why it can
-            # be interpolated at all.
-            resp = HTMLResponse(f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
-<style>
-  body{{background:#07090f;color:#dde3ed;font-family:sans-serif;
-       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}}
-  p{{color:#5e6a7e;font-size:14px}}
-</style></head>
-<body>
-<script>
-  sessionStorage.setItem('jarvis_token','{bearer}');
-  sessionStorage.setItem('jarvis_secret','{session.secret}');
-  localStorage.setItem('jarvis_device_token','{device}');
-  setTimeout(function(){{location.replace('/')}},400);
-</script>
-<p>Connecting to JARVIS…</p>
-</body></html>""")
+            resp = JSONResponse({"ok": True, "token": bearer,
+                                 "secret": session.secret, "device": device})
             _set_nav_cookie(req, resp, nav)
             return resp
 
@@ -965,8 +1014,21 @@ class DashboardServer:
         # Both of these touch the network or a subprocess, so neither belongs on
         # the event loop (R-07). Neither blocks startup either — uvicorn is up
         # before they finish.
-        loop.run_in_executor(None, _ensure_crypto_js)
-        loop.run_in_executor(None, _firewall_hint, PORT, PORT + 1)
+        # Kept, not awaited. Neither should block startup, but discarding the
+        # Future means an exception inside either is never retrieved and never
+        # printed — a read-only cache directory or a firewall probe that raises
+        # would simply produce nothing at all.
+        def _report(fut, what=""):
+            exc = fut.exception()
+            if exc is not None:
+                print(f"[Dashboard] {what} failed: {type(exc).__name__}: {exc}")
+
+        self._startup_tasks = [
+            loop.run_in_executor(None, _ensure_crypto_js),
+            loop.run_in_executor(None, _firewall_hint, PORT, PORT + 1),
+        ]
+        for fut, what in zip(self._startup_tasks, ("CryptoJS setup", "firewall check")):
+            fut.add_done_callback(lambda f, w=what: _report(f, w))
 
         # Generate the TLS pair on first run so no private key ships in the repo.
         await loop.run_in_executor(None, _ensure_certs)

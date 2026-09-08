@@ -49,6 +49,7 @@ CHOOSING A PROVIDER
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -159,20 +160,36 @@ def _resolve(needs: set[str], tier: str, budget: Budget | None = None) -> list:
     thinks it knows better — but it no longer wins by default.
     """
     reachable = reachable_providers()
-    budget = budget or Budget(tier=tier, needs=frozenset(needs))
-    budget = Budget(
-        tier=tier,
-        needs=frozenset(needs),
-        max_latency_ms=budget.max_latency_ms,
-        max_cost_usd=budget.max_cost_usd,
-        privacy=budget.privacy,
-    )
+    asked = budget or Budget(tier=tier, needs=frozenset(needs))
 
+    # `replace`, not a fresh Budget: rebuilding it field by field dropped
+    # est_tokens_in / est_tokens_out / est_cached_in, so a caller who had
+    # described the shape of their request got the median-request defaults
+    # priced against their max_cost_usd instead of their own numbers.
+    budget = dataclasses.replace(asked, tier=tier, needs=frozenset(needs))
+
+    # A budget states a constraint. When nothing satisfies it, the honest answer
+    # is to say so — NOT to widen the search until something does.
+    #
+    # This used to catch NoModelFits, set `ranked = []`, and fall through to the
+    # loop below, which appends every reachable provider. So Budget.private(),
+    # documented as "ne quitte pas la machine", sent the prompt to Gemini,
+    # Anthropic and OpenAI in precisely the situation the guarantee exists for:
+    # no local model available. R-12 says a budget that cannot be met raises.
+    #
+    # The one widening that is still correct is the *unconstrained* case: a
+    # caller who asked only for a tier is not asserting anything the catalogue
+    # could violate, so a provider the catalogue has not caught up with may
+    # still answer. That is the `constrained` test below, and it is the whole
+    # difference between a fallback and a broken promise.
+    constrained = (budget.max_latency_ms is not None
+                   or budget.max_cost_usd is not None
+                   or budget.privacy != Privacy.ANY)
     try:
         ranked = router.candidates(budget, available=reachable)
     except NoModelFits:
-        # No catalogue entry fits. Fall back to raw capability matching so a
-        # provider the catalogue has not caught up with can still answer.
+        if constrained:
+            raise
         ranked = []
 
     order: list[str] = []
@@ -185,9 +202,11 @@ def _resolve(needs: set[str], tier: str, budget: Budget | None = None) -> list:
         order.remove(preferred)
         order.insert(0, preferred)
 
-    for name in _PROVIDERS:
-        if name not in order and name in reachable and needs <= _PROVIDERS[name].CAPABILITIES:
-            order.append(name)
+    if not constrained:
+        for name in _PROVIDERS:
+            if (name not in order and name in reachable
+                    and needs <= _PROVIDERS[name].CAPABILITIES):
+                order.append(name)
 
     return [_PROVIDERS[n] for n in order if needs <= _PROVIDERS[n].CAPABILITIES]
 

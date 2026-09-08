@@ -45,7 +45,7 @@ except Exception:
 try:
     import PIL.Image
     _PIL = True
-except ImportError:
+except Exception:
     _PIL = False
 
 def _base_dir() -> Path:
@@ -141,7 +141,12 @@ def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
     cap.release()
     if not ret or frame is None:
         return False
-    return bool(np.mean(frame) > 8)
+    # `frame.mean()`, not `np.mean(frame)`: numpy was never imported in this
+    # file, so every camera probe that actually got a frame raised NameError —
+    # the branch died precisely when it was working. cv2 hands back an ndarray,
+    # which carries the method, so the import was never needed at all.
+    # pyflakes had reported this all along; nobody was running pyflakes.
+    return bool(frame.mean() > 8)
 
 
 def _detect_camera_index() -> int:

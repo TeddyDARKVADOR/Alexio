@@ -24,3 +24,7 @@ logs/
 Thumbs.db
 desktop.ini
 *.bak
+
+# Données de mesure locales, régénérées par `python -m tools.jarvis_health --measure`.
+.jarvis-health/
+.coverage

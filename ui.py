@@ -2646,7 +2646,7 @@ class MainWindow(QMainWindow):
             import PIL.Image
             import PIL.ImageDraw
             import PIL.ImageFilter
-        except ImportError:
+        except Exception:
             return False
 
         CYAN   = (0, 212, 255)

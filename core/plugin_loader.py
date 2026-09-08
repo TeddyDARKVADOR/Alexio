@@ -56,14 +56,16 @@ class PluginRegistry:
         return name in self._plugins
 
     # -- called by main.py from _execute_tool's else branch --
-    def run(self, name: str, parameters: dict, player=None, session_memory=None) -> str:
+    def run(self, name: str, parameters: dict, player=None, session_memory=None,
+            response=None, speak=None) -> str:
         rec = self._plugins.get(name)
         if rec is None or not rec.valid:
             return f"Plugin '{name}' is not available."
         if not get_plugin_enabled(name):
             return f"The '{name}' plugin is currently disabled."
         try:
-            return _call_run(rec.run, parameters, player, session_memory) or "Done."
+            return _call_run(rec.run, parameters, player, session_memory,
+                             response, speak) or "Done."
         except Exception as e:
             self._logger(f"Plugin '{name}' crashed during run(): {e}")
             traceback.print_exc()
@@ -84,16 +86,23 @@ class PluginRegistry:
         return out
 
 
-def _call_run(run_fn, parameters, player, session_memory):
+def _call_run(run_fn, parameters, player, session_memory, response=None, speak=None):
     """Invoke run() passing only the kwargs it actually declares (or all of them
-    if it has **kwargs), so a minimal `def run(parameters):` plugin still works."""
+    if it has **kwargs), so a minimal `def run(parameters):` plugin still works.
+
+    R-03 names five arguments — parameters, response, player, session_memory,
+    speak — and this knew about two. A plugin declaring `speak=` got the
+    default instead of the callable, silently: nothing raised, the plugin simply
+    could not talk. Which is the worst shape for a contract to break in, because
+    the author has no way to tell it from their own bug.
+    """
     sig = inspect.signature(run_fn)
-    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-    kwargs = {}
-    if has_var_kw or "player" in sig.parameters:
-        kwargs["player"] = player
-    if has_var_kw or "session_memory" in sig.parameters:
-        kwargs["session_memory"] = session_memory
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD
+                     for p in sig.parameters.values())
+    offered = {"player": player, "session_memory": session_memory,
+               "response": response, "speak": speak}
+    kwargs = {name: value for name, value in offered.items()
+              if has_var_kw or name in sig.parameters}
     return run_fn(parameters, **kwargs)
 
 

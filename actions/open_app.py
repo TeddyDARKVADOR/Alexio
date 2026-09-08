@@ -1,3 +1,4 @@
+import re
 import time
 import subprocess
 import platform
@@ -6,7 +7,7 @@ import shutil
 try:
     import psutil
     _PSUTIL = True
-except ImportError:
+except Exception:
     _PSUTIL = False
 
 _SYSTEM = platform.system()
@@ -77,13 +78,36 @@ def _normalize(raw: str) -> str:
 
     return raw  
 
-def _launch_windows(app_name: str) -> bool:
+# A Windows shell URI: "ms-settings:display", "steam://run/440". Anchored, so a
+# scheme is all it can be — `ms-settings: & calc` does not match, which is the
+# whole point.
+_URI_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:[^\s&|;<>^\"'`%]*$")
 
-    if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
+
+def _launch_windows(app_name: str) -> bool:
+    """Launch by name on Windows, without ever building a shell command line.
+
+    WHAT THIS USED TO DO, AND WHY IT WAS A HOLE
+        `if shutil.which(app_name) or shutil.which(app_name.split(".")[0])`
+        followed by `Popen(app_name, shell=True)`. The guard resolves a *prefix*
+        and the call runs the *whole string*: which("notepad") answers yes for
+        "notepad.exe & calc", and cmd then runs both halves. `app_name` is a
+        tool parameter — the model writes it — and open_app is classified RUN,
+        so nothing asks first. The second branch did the same behind
+        `if ":" in app_name`, which is a shape test, not a sanitiser.
+
+        Windows-only, which is why nothing had hit it: Alexio has never run
+        there since the refactor.
+
+    The fix is not a better filter. It is to stop handing a string to a shell:
+    `which()` now resolves to a real executable path and that path is launched
+    as argv[0], so whatever else is in the string is an argument, not a command.
+    """
+    resolved = shutil.which(app_name)
+    if resolved:
         try:
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [resolved],                       # argv, never a command line
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -92,9 +116,15 @@ def _launch_windows(app_name: str) -> bool:
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
 
-    if ":" in app_name:
+    # A shell URI still needs the shell's `start` verb, so it is matched against
+    # a scheme grammar first and passed as a separate argument afterwards. Two
+    # independent reasons it cannot inject: it never becomes part of a command
+    # string, and the characters that would matter if it did are excluded.
+    if _URI_RE.match(app_name):
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
+            subprocess.Popen(["cmd", "/c", "start", "", app_name],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
             time.sleep(1.0)
             return True
         except Exception:

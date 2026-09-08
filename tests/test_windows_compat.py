@@ -218,6 +218,11 @@ def test_absolute_posix_paths_only_appear_in_platform_aware_files():
         tree = _tree(path)
         if _module_has_platform_guard(tree) or path.name in ("linux.py", "macos.py"):
             continue
+        # A test whose *subject* is a hostile absolute path has to contain one.
+        # tests/test_security_invariants.py feeds "/etc/cron.d/x" to safe_join
+        # to prove it is refused; forbidding the literal would forbid the test.
+        if path.name == "test_security_invariants.py":
+            continue
         for node in ast.walk(tree):
             if (isinstance(node, ast.Constant) and isinstance(node.value, str)
                     and node.value.startswith(prefixes) and len(node.value) > 6):

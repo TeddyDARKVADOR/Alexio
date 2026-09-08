@@ -338,6 +338,114 @@ effet de bord apprend à l'utilisateur à dire oui. Un « non » imprime la comm
 
 ---
 
+## `./jarvis` — l'interface de développement
+
+```bash
+./jarvis help                     # les commandes
+./jarvis check                    # avant chaque commit — 4,4 s, pas la suite
+./jarvis test --group security
+./jarvis test --failed
+./jarvis coverage core.ai.router
+./jarvis rules --explain JAR012
+./jarvis audit --critical
+./jarvis health
+```
+
+`check` est statique : parse, noms (pyflakes), les 20 règles, la baseline, le
+registre. **Il ne lance pas la suite** — une vérification de pré-commit qui prend
+une minute est une vérification que personne ne lance, et les garde-fous ne
+tirent alors qu'en CI, où ils coûtent un aller-retour au lieu d'une frappe.
+`check` trouve le `NameError` de `screen_processor.py:144` en 4 s.
+
+Le script épingle `.venv/bin/python` délibérément : le Python système est en
+3.14 et l'app tourne sur le venv 3.11. Un outil qui mesure un autre arbre que
+celui qui s'exécute ne mesure rien.
+
+## `tools/jarvis_lint` — les invariants, appliqués
+
+```bash
+.venv/bin/python -m tools.jarvis_lint            # ce qui est neuf depuis la baseline
+.venv/bin/python -m tools.jarvis_lint --all      # tout, baseline comprise
+.venv/bin/python -m tools.jarvis_lint --rules    # à quoi sert chaque règle
+```
+
+L'audit du 2026-09-08 a trouvé 21 défauts. **La moitié n'étaient pas des erreurs ordinaires :**
+c'étaient des endroits où une règle écrite ici n'avait aucune contrepartie mécanique dans le
+code. R-12 disait « lève une erreur » et `core/ai/__init__.py` avalait la levée ; R-18 disait
+« le dispatch consulte la porte » et la branche plugin ne la consultait pas ; R-02 disait
+« aucun identifiant de modèle hors `core/ai/` » et deux modules d'action en épinglaient un —
+personne ne l'avait jamais vu parce que `tests/test_tool_wiring.py` ne vérifie que les
+_imports_ de SDK, pas les identifiants.
+
+Une règle qui n'existe qu'en prose est une règle que le prochain changement casse en silence,
+que ce changement vienne d'une personne ou d'un agent. Onze règles vivent donc maintenant dans
+`tools/jarvis_lint/`, et elles font échouer un test.
+
+| Règle  | Ce qu'elle interdit                                         | Née de |
+| ------ | ----------------------------------------------------------- | ------ |
+| JAR001 | écrire via un chemin lu dans un document du modèle sans confinement | `dev_agent` écrivait sur `/etc/` |
+| JAR002 | un identifiant de modèle hors `core/ai/` (R-02)             | `dev_agent`, `code_helper` |
+| JAR003 | exécuter un outil sans verdict de `tool_policy` (R-18)      | la branche plugin |
+| JAR004 | avaler une contrainte non satisfaite (R-12)                 | `Budget.private()` partait chez Google |
+| JAR005 | lever un drapeau d'état sans `finally`                      | `_vision_busy` bloqué à vie |
+| JAR006 | jeter le `Future` d'un `run_in_executor`                    | `dashboard/server.py` |
+| JAR007 | une route GET qui change l'état                             | `/auto-login` dépense le PIN |
+| JAR008 | un dict indexé par l'appelant sans plafond (dashboard)      | `Throttle._fails` |
+| JAR009 | rendre l'état mutable d'une spec par référence              | `ToolSpec.to_anthropic` |
+| JAR010 | relire tout le journal sur le chemin chaud                  | 491 ms par `ai.generate()` |
+| JAR011 | `except ImportError` sur un paquet à extension native       | 11 gardes étroites |
+| JAR012 | `shell=True` avec une commande assemblée à l'exécution       | `open_app` — injection depuis un paramètre d'outil |
+| JAR013 | une ligne de commande produite par `.split()`                | `dev_agent._run_project` |
+| JAR014 | `tempfile.mktemp`                                            | 5 sites |
+| JAR015 | le verdict de `tool_policy` obtenu puis jeté                 | rien — le bug d'après |
+| JAR016 | détruire sans enregistrer d'undo (R-05)                      | 7 appels, 4 modules |
+| JAR017 | comparer un secret avec `==`                                 | rien — prophylactique |
+| JAR018 | un secret dans un log                                        | rien — prophylactique |
+| JAR019 | vérification de certificat désactivée                        | rien — prophylactique |
+| JAR020 | un verdict RUN qui invoque un bac à sable non testé          | `desktop_control` |
+
+## `tools/jarvis_health` — trois mesures, jamais interchangeables
+
+```bash
+./jarvis health          # le score composite
+./jarvis audit --tree    # couverture contre garanties, par module
+```
+
+**Couverture de code** = cette ligne a-t-elle été exécutée. **Couverture de
+comportement** = cette garantie est-elle vérifiée. **Couverture de règles** =
+cet invariant est-il mécaniquement imposé. Les trois ne se remplacent pas :
+`core/ai/router.py` est à 97 % de lignes, 93 % de branches, et `Budget.private`
+mesure **100 %** pendant que la garantie « ne quitte pas la machine » est cassée.
+`test_revoking_devices_actually_revokes_them` passe et ne vérifie pas que les
+sessions meurent.
+
+**Une violation critique plafonne le score, elle ne le grignote pas.** Un poids
+se dilue — ajoutez vingt modules bien testés et n'importe quel seuil redevient
+atteignable. Un plafond, non : une garantie critique cassée et le score ne peut
+pas dépasser 49. `tests/test_health_ledger.py` vérifie la propriété.
+
+Le registre (`behaviors.py`) est écrit à la main — il le faut, aucun outil ne
+peut deviner que la question intéressante sur `core/ai/__init__.py` est de savoir
+si `Budget.private()` refuse encore. Il est donc tenu à la même discipline que la
+baseline : `reconcile()` échoue dans les deux sens, et un identifiant de test
+inexistant est une erreur, pas une dégradation silencieuse en « non prouvée ».
+
+**La baseline n'est pas une liste d'exemptions.** Elle a été posée à 46 violations le jour
+de l'installation des règles — exempter les défauts existants était le seul moyen de ne pas
+rendre le linter vert par décret. Elle est **à 6**. Le test échoue sur tout ce qui n'y est pas,
+et corriger un défaut = supprimer sa ligne.
+Corriger un défaut = supprimer une ligne du fichier, et une entrée qui ne se reproduit plus est
+elle-même une erreur (`--check-stale`) — sinon la prochaine occurrence réelle du même défaut
+serait pardonnée en silence.
+
+**Chaque règle a un test positif _et_ un test négatif**, et un méta-test refuse une règle qui
+n'aurait que l'un des deux. Le négatif est le porteur : JAR009 épinglait d'abord un `__repr__`,
+JAR004 le repli entre providers pourtant documenté, JAR001 quatorze écritures de fichier
+ordinaires. Une règle sans test négatif est une règle dont personne n'a vérifié les faux
+positifs — et un linter qui crie au loup finit en liste d'exemptions, c'est-à-dire en prose.
+
+---
+
 ## Dette connue
 
 Corrigé en phase 00 : le prompt qui appelait `agent_task` (inexistant), le message réseau en
@@ -435,8 +543,51 @@ apparue ni sur 13 min de session nue, ni sous un blocage de 35 s du consommateur
 reste à distinguer — réseau contre boucle bloquée — est désormais mesuré en continu par
 `_LoopLag`, et la prochaine occurrence l'imprimera d'elle-même.
 
+### Corrigé le 2026-09-08, après l'audit des 25 défauts
+
+Vingt et un des vingt-cinq, chacun avec un test qui aurait échoué avant. Les tests de
+comportement vivent dans `tests/test_security_invariants.py` — ils vérifient les *phrases*
+que la documentation promet à l'utilisateur, pas les unités.
+
+- **R-12 rétablie.** `_resolve` avalait `NoModelFits` et la boucle en dessous rajoutait tous
+  les providers joignables, donc `Budget.private()` partait chez Gemini, Anthropic et OpenAI
+  dans exactement le cas où la garantie existe. Elle lève désormais — sauf pour une requête
+  **sans contrainte**, où élargir reste correct, et c'est toute la différence entre un repli
+  et une promesse cassée.
+- **`core/paths.py`.** `safe_join(root, tail)` : pathlib jette la base quand la queue est
+  absolue, donc `project_dir / plan["path"]` n'était pas un contrôle. `dev_agent` écrivait
+  où le planificateur demandait. `~` est refusé plutôt que résolu — son sens dépend de qui
+  l'expanse.
+- **La porte couvre les plugins (R-18).** La branche plugin ne consultait rien, et
+  `tool_policy.register()` n'existe que pour eux.
+- **Injection de commande.** `open_app._launch_windows` validait un *préfixe*
+  (`which(app_name.split(".")[0])`) puis exécutait la chaîne entière au shell.
+  `app_name` vient du modèle. Plus aucun `shell=True` : `which()` résout un chemin, lancé
+  comme argv[0].
+- **Le routeur compare enfin la même statistique** : `latency_ms` rend le p50 mesuré face au
+  `typical_latency_ms` déclaré. Le p95 reste disponible sous `latency_p95_ms`, séparément.
+- **`revoke_devices()` tue les sessions ouvertes** — et le cookie de navigation, et les
+  tickets. `test_revoking_devices_actually_revokes_them` passait depuis toujours : il
+  vérifiait que le dictionnaire était vidé.
+- **La télémétrie ne relit plus tout** : 491 ms → 104 ms par décision de routage, en bornant
+  la *lecture* et pas la liste rendue.
+- **Le bac à sable de `desktop_control` est testé** — la phrase qui justifie d'exécuter du
+  code du modèle sans confirmation ne coûtait rien à personne.
+- Plus : le `NameError` de `screen_processor`, le drapeau vision bloqué à vie, la bannière de
+  confirmation qui restait après expiration, le `Throttle` non borné, `/auto-login` qui
+  dépensait le PIN sur un GET, les `Future` jetées, `ToolSpec` qui rendait son état par
+  référence, les 5 `mktemp`, les 11 gardes d'import étroites, `run_command.split()` →
+  `shlex.split`, les identifiants de modèle morts (R-02), le contexte R-03 des plugins, le
+  hash SHA-512 à chaque requête, le backoff local mort, et R-05 rétablie sur les deux
+  réorganisateurs de bureau.
+
 Reste :
 
+- **R-05 n'est pas tenue par cinq appels** restants (`reminder` ×3, `code_helper`,
+  `game_updater`) — tous des suppressions de fichiers que la fonction vient d'écrire, donc du
+  ménage plutôt que de la perte. Dans la baseline JAR016, à trancher un par un.
+- `_vision_close_pending` est levé sans `finally` dans `_receive_audio` : le drapeau est
+  délibérément passé au tour suivant, et une reconnexion le remet à zéro. Baseline JAR005.
 - Le classifieur d'intention (classe « Réflexe », < 200 ms sans modèle) reste à faire —
   il vit avec le mot de réveil en phase 05.
 - `computer_settings.volume_get()` renvoie `None` sur cette machine Windows alors que

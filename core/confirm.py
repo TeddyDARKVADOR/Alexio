@@ -151,11 +151,35 @@ def resolve(accepted: bool) -> None:
                      name=f"confirm-{p.key}").start()
 
 
+def expire_if_due() -> bool:
+    """Take an abandoned banner down. Returns True if one was removed.
+
+    The timeout used to be consulted only inside resolve(), so nothing ever
+    called _hide_cb on expiry: the banner stayed on screen indefinitely, and a
+    user who came back and pressed CONFIRM got a log line and no action. A
+    button that does nothing is worse than no button — it reads as a refusal
+    the assistant never explains.
+
+    Called from pending_title(), which every gate consults, so an abandoned
+    banner disappears at the next tool call without a timer of its own.
+    """
+    global _pending
+    with _lock:
+        if _pending is None or time.monotonic() - _pending.at <= TIMEOUT_SECONDS:
+            return False
+        stale, _pending = _pending, None
+
+    if _hide_cb:
+        try:
+            _hide_cb()
+        except Exception:
+            pass
+    _log(f"SYS: Confirmation expired — {stale.title}")
+    return True
+
+
 def pending_title() -> str:
     """'' when nothing is waiting. Lets an action avoid stacking two banners."""
+    expire_if_due()
     with _lock:
-        if _pending is None:
-            return ""
-        if time.monotonic() - _pending.at > TIMEOUT_SECONDS:
-            return ""
-        return _pending.title
+        return "" if _pending is None else _pending.title

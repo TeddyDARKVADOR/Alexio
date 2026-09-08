@@ -15,21 +15,20 @@ BASE_DIR           = get_base_dir()
 API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
-GEMINI_MODEL       = "gemini-flash-latest"
 
 
-def _get_gemini(model: str = GEMINI_MODEL, task: str = "code_helper"):
+def _get_gemini(task: str = "code_helper", cheap: bool = False):
     """Kept as a shim so the six `model.generate_content(...)` call sites in this
     file stay untouched; everything behind it now goes through core/ai.
 
-    The `model` argument survives only for the callers that still pass one. It
-    is read as an *intent* — a lite id means the job is cheap — because a call
-    site should say what the work deserves, not name a product that will be
-    renamed within the year.
+    R-02: this used to take a model id and read it as an *intent* — "lite" in
+    the name meant the job was cheap. That is a tier wearing a product name, and
+    the product gets renamed within the year. `cheap` says the same thing
+    without pinning anything, and the router is free to answer.
     """
     from core import ai
 
-    tier = ai.Tier.FAST if "lite" in (model or "").lower() else ai.Tier.STANDARD
+    tier = ai.Tier.FAST if cheap else ai.Tier.STANDARD
 
     class _W:
         def generate_content(self, contents):

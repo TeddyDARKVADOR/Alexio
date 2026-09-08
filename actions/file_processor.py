@@ -107,7 +107,7 @@ def _output_path(src: Path, suffix: str, new_ext: str = None) -> Path:
 def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
     try:
         from PIL import Image
-    except ImportError:
+    except Exception:
         return "Pillow is not installed. Run: pip install Pillow"
 
     action = action or "describe"
@@ -206,7 +206,7 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             with pdfplumber.open(path) as pdf:
                 for page in pdf.pages:
                     text += (page.extract_text() or "") + "\n"
-        except ImportError:
+        except Exception:
             try:
                 import PyPDF2
                 with open(path, "rb") as f:
@@ -340,7 +340,7 @@ def _process_data(path: Path, file_type: str, action: str,
                   params: dict, speak=None) -> str:
     try:
         import pandas as pd
-    except ImportError:
+    except Exception:
         return "pandas not installed. Run: pip install pandas openpyxl"
 
     action = action or "analyze"
@@ -471,7 +471,7 @@ def _process_json(path: Path, action: str, params: dict, speak=None) -> str:
                 df.to_csv(out, index=False)
                 return f"Converted to CSV. Saved: {out.name}"
             return "JSON must be an array of objects to convert to CSV."
-        except ImportError:
+        except Exception:
             return "pandas not installed."
 
     return _process_json(path, "analyze", {"instruction": action})
@@ -703,7 +703,9 @@ def _process_video(path: Path, action: str, params: dict, speak=None) -> str:
     if action == "transcribe":
         if not _ffmpeg_available():
             return "ffmpeg not found. Needed for video transcription."
-        tmp_audio = Path(tempfile.mktemp(suffix=".mp3"))
+        _fd, _name = tempfile.mkstemp(suffix=".mp3")
+        os.close(_fd)
+        tmp_audio = Path(_name)
         try:
             subprocess.run(
                 ["ffmpeg", "-i", str(path), "-q:a", "0", "-map", "a",

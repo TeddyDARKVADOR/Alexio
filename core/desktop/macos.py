@@ -22,6 +22,7 @@ from __future__ import annotations
 import platform
 import subprocess
 import sys
+import os
 import tempfile
 from pathlib import Path
 
@@ -58,7 +59,9 @@ def screenshot_capability() -> Capability:
 
 def screenshot() -> tuple[bytes, str]:
     _requires_macos()
-    out = Path(tempfile.mktemp(suffix=".png"))
+    _fd, _name = tempfile.mkstemp(suffix=".png")
+    os.close(_fd)
+    out = Path(_name)
     try:
         # -x silences the shutter sound, which an assistant taking a look at the
         # screen every few minutes would otherwise make unbearable.
